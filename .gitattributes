@@ -1,0 +1,10 @@
+# Normaliza los finales de línea en el repositorio.
+* text=auto
+
+# build.sh se ejecuta con bash: debe conservar LF aunque se clone en Windows.
+*.sh text eol=lf
+
+# El HTML compilado es salida de build.sh; márcalo para que los diffs no
+# ensucien las revisiones. Sigue versionándose: es el archivo que se abre
+# con doble clic para jugar.
+crisol-arena.html linguist-generated=true

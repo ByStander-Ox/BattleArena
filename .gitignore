@@ -1,0 +1,17 @@
+# El zip original: redundante desde que src/ está en el repositorio.
+crisol-arena.zip
+
+# Basura del sistema operativo
+Thumbs.db
+ehthumbs.db
+desktop.ini
+.DS_Store
+
+# Editores
+.vscode/
+.idea/
+*.swp
+*~
+
+# Por si algún día entra tooling
+node_modules/
