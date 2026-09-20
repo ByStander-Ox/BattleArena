@@ -80,7 +80,8 @@ let bad = 0;
 
 /* ---- 2. la simulación no toca la vista ---- */
 {
-  const SIM = ['10_core.js', '20_champs.js', '30_combat.js', '40_ai.js', '50_match.js'];
+  const SIM = ['10_core.js', '20_champs.js', '30_combat.js', '40_ai.js', '50_match.js',
+               '55_net.js', '56_server.js', '57_client.js'];
   const FORBIDDEN = ['THREE.', 'document.', 'window.', 'scene.', 'renderer.', 'camera.',
                      'requestAnimationFrame', 'SFX.', 'localStorage'];
   const hits = [];

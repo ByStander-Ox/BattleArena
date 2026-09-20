@@ -113,7 +113,7 @@ const G = {
   player: null, t: 0, dt: 0, paused: false,
   round: 1, score: [0, 0], roundTime: 0, sudden: false, shrink: 1,
   picks: 0, timeScale: 1, nextOrb: 0, nextHeal: 0, started: false,
-  firstBlood: false, order: 0, relicOptions: null,
+  firstBlood: false, order: 0, relicOptions: null, mute: false,
   seed: 0                  // semilla de la partida: basta para repetirla entera
 };
 const fighterById = id => G.byId.get(id) || null;
@@ -152,7 +152,10 @@ const DIFFS = {
    eventos llevan identificadores y números, nunca referencias a objetos ni
    texto ya compuesto. Quien decide que «Vesk elimina a Brakk» se lee así es la
    vista, a partir de `{e:'kill', id, byId}`. */
-function emit(ev) { G.events.push(ev); return ev; }
+/* `G.mute` lo levanta el cliente mientras predice o reconcilia: en esos pasos
+   la simulación se ejecuta de nuevo sobre estado ya visto, y lo que anote no
+   debe verse ni oírse dos veces. Quien decide qué se ve es el servidor. */
+function emit(ev) { if (G.mute) return ev; G.events.push(ev); return ev; }
 
 const sfx = id => emit({ e: 'sfx', id });
 const fxNum = (p, text, cls) => emit({ e: 'num', x: p.x, z: p.z, text, cls });

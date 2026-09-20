@@ -5,10 +5,12 @@ jugador contra bots, todo en una pestaña. Este documento decide **qué modelo d
 red usar**, audita **qué del código actual lo impide** y propone **un plan por
 etapas** en el que cada paso se puede entregar y probar por separado.
 
-**Estado: etapas 1 y 2 hechas.** La simulación es determinista, la entrada es
-un dato y el código de juego ya no depende de three.js, del DOM ni del audio:
-corre entero en Node. Falta la red — no hay servidor, ni socket, ni una sola
-línea de protocolo. Cada apartado dice en qué punto está.
+**Estado: etapas 1, 2 y el grueso de la 3.** La simulación es determinista, la
+entrada es un dato, el código de juego no depende del navegador, y ya existen
+el protocolo binario, el servidor autoritativo y el cliente con predicción,
+reconciliación e interpolación, medidos contra una red simulada. Lo que falta
+de la 3 es enchufarlo al navegador; de momento el juego sigue siendo local.
+Cada apartado dice en qué punto está.
 
 ---
 
@@ -274,7 +276,7 @@ usarlo, contra el índice `G.byId`: `proj.ownerId`, `zone.ownerId`,
 desplazamientos. `quitMatch` reinicia el contador de ids a cero, como haría un
 servidor al abrir una sala.
 
-### 3.6 `G` es un singleton — `10_core.js` · pendiente, a propósito
+### 3.6 `G` es un singleton — `10_core.js` · resuelto de hecho, no de derecho
 
 Un servidor necesita muchas partidas por proceso. Hoy hay un `G` global y
 funciones que lo leen directamente.
@@ -285,9 +287,14 @@ funciones lo reciben como primer parámetro. Es un refactor extenso y mecánico.
 **Atajo defendible**: un proceso (o un Worker) por partida, con `G` global
 dentro. Seis jugadores por partida y partidas de diez minutos hacen que el coste
 por proceso sea asumible hasta cifras de usuarios que este proyecto no va a ver
-pronto. Recomendación: **empezar por el atajo**, medir, y hacer el refactor solo
-si el coste de memoria aparece de verdad. Un proceso por partida además aísla
-los fallos: una partida que revienta no se lleva las demás.
+pronto. Un proceso por partida además aísla los fallos: una partida que revienta
+no se lleva las demás.
+
+Es lo que se ha hecho, y funciona: `tests/netloop.js` corre el cliente y el
+servidor en dos contextos aislados, cada uno con su `G`, sin una línea de
+refactor. Un Web Worker da exactamente lo mismo en el navegador, y un proceso
+Node lo mismo en el servidor. El refactor a `createGame(cfg)` sigue apuntado
+para cuando el coste de memoria aparezca de verdad, no antes.
 
 ### 3.7 La entrada se lee desde dentro de la simulación — el bucle · **hecho**
 
@@ -390,20 +397,61 @@ Cola de eventos (§3.3), `champs.data.js` separado de `champs.view.js`, sacar
 **Criterio de aceptación**: `sim.js` corre **sin `test_stub.js`**. Ese es el
 momento exacto en el que existe un servidor posible.
 
-### Etapa 3 — Loopback en Worker *(2-3 días)*
+### Etapa 3 — Predicción y reconciliación · **el núcleo hecho, falta el navegador**
 
-La simulación se muda a un Web Worker. El hilo principal solo envía comandos de
-entrada y recibe instantáneas, con el mismo protocolo binario que usará el
-servidor. Sigue siendo un juego de un jugador contra bots, pero ya a través de
-la frontera de red.
+Hecho:
 
-Aquí se implementan y se depuran **la predicción, la reconciliación y la
-interpolación**, con latencia y pérdida de paquetes simuladas a voluntad
-(`LoopbackTransport` con un retardo configurable). Depurar esto con un servidor
-real de por medio es varias veces más caro.
+- `55_net.js` — el protocolo binario. Instantánea de 3v3: **183 B de media, 278 B
+  la mayor**, que a 20 Hz son 3,6 KB/s por cliente. Comprobado de ida y vuelta
+  en `tests/net.js`.
+- `56_server.js` — el servidor autoritativo: recibe comandos, simula a 60 pasos
+  fijos, emite una instantánea cada tres. Corre en Node tal cual.
+- `57_client.js` — predicción del luchador local, reconciliación con reaplicación
+  de los comandos sin confirmar, e interpolación de todo lo demás con 100 ms de
+  retraso.
+- `tests/netloop.js` — cliente y servidor en dos contextos aislados (cada uno con
+  su `G`, como lo estarán el hilo y el Worker) unidos por una red con latencia,
+  fluctuación y pérdida configurables, y un reloj virtual: 30 s de juego en
+  menos de un segundo.
 
-**Criterio de aceptación**: con 150 ms de latencia simulada y 5 % de pérdida, el
-juego se siente como en local.
+**El criterio, hecho medible.** «Se siente como en local» no se puede afirmar
+sin jugar, así que se mide otra cosa que sí se puede: **la posición que predice
+el cliente para un comando contra la que saca el servidor al procesarlo**. Eso
+no pasa por la red ni por la reconciliación — compara las dos simulaciones
+directamente.
+
+| escenario | coinciden paso a paso | reconciliación (mediana) | huecos |
+|---|---|---|---|
+| en vacío, 0 ms | 99,9 % · peor 282 mm | 1,9 mm | 0 |
+| en vacío, 150 ms / 5 % | — | 2,0 mm | 0 |
+| combate, 0 ms | — | 1,9 mm | 0 |
+| combate, 60 ms / 1 % | 91 % | 1,6 mm | 0 |
+| combate, 150 ms / 5 % | 80 % | 1,9 mm | 0 |
+| combate, 250 ms / 12 % | 73 % | 2,2 mm | 1 |
+
+La mediana se queda clavada en los 2 mm en todos los escenarios, y 2 mm es
+exactamente el suelo de cuantización del cable (i16 a 1/256 de metro). Es decir:
+**el cliente y el servidor llegan al mismo sitio, y lo siguen haciendo con 250 ms
+de latencia y una de cada ocho tramas perdida.**
+
+**El defecto conocido, y su arreglo.** El 0,1 % de pasos que no coinciden en
+vacío es siempre lo mismo, y conviene tenerlo escrito: el cliente predice un
+paso por delante del servidor, así que cuando una recarga expira exactamente en
+ese paso, el cliente lanza el ataque y el servidor todavía no. El cliente
+canaliza —al 42 % de velocidad— mientras el servidor corre, y en los 70 ms que
+dura la canalización del básico eso son 28 cm. La siguiente instantánea lo
+corrige y no queda rastro.
+
+El arreglo de verdad es **alinear los ticks**: que el comando lleve el número de
+tick de servidor para el que se predijo, y que el servidor lo ejecute en ese
+tick en vez de consumir uno por paso. Es lo que hace un netcode maduro y es el
+primer trabajo de la etapa 4. Mientras tanto, `tests/netloop.js` vigila que la
+tasa no suba del 2 %.
+
+**Lo que falta de esta etapa**: mudar el servidor a un Web Worker y darle al
+menú una opción para jugar contra él. El código no cambia — el Worker tiene su
+propio ámbito global, así que su `G` es otro `G` sin tocar nada — pero es la
+parte que no se puede verificar sin navegador.
 
 ### Etapa 4 — Servidor de verdad *(1-2 semanas)*
 

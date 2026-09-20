@@ -32,8 +32,8 @@ Estas cinco rompen el juego de formas que no dan error en consola:
    que tiene este proyecto por delante. `node tests/lint.js` lo impide.
 7. **Lo que cambia el estado va en `simStep`, y recibe `STEP`.** Nunca `raw`, ni
    el delta del fotograma. Lo que dibuja va en `frame` y puede usar `raw`.
-8. **La simulación (10-50) no puede tocar la vista.** Ni `THREE`, ni `document`,
-   ni `scene`, ni `SFX`. Si algo tiene que verse u oírse, sale por la cola de
+8. **La simulación y la red (10-57) no pueden tocar la vista.** Ni `THREE`, ni `document`,
+   Ni `THREE`, ni `document`, ni `scene`, ni `SFX`. Si algo tiene que verse u oírse, sale por la cola de
    eventos: `sfx('shot')`, `fxRing(pos, r, col)`, `emit({e:'kill', id, byId})`.
    Cruzar esa línea ata el juego al navegador y mata el servidor antes de que
    exista. `node tests/lint.js` también lo impide.
@@ -135,17 +135,19 @@ después.
 
 ```bash
 ./build.sh                  # src/ → crisol-arena.html
-node tests/sim.js           # equilibrio y salud de la simulación (~250 ms)
-node tests/e2e.js           # recorrido completo del juego
+node tests/sim.js           # 12 rondas de bots 3v3, sin dobles, ~250 ms
+node tests/e2e.js           # recorrido completo: menú → rondas → reliquias → resultado
 node tests/determinism.js   # misma semilla ⇒ misma partida
 node tests/input_cmd.js     # el comando de entrada, de punta a punta
+node tests/net.js           # el protocolo de cable, de ida y vuelta
+node tests/netloop.js       # cliente y servidor con latencia y pérdida simuladas
 node tests/lint.js          # azar con semilla y frontera simulación/vista
 ```
 
 El ciclo normal es: editar `src/` → `./build.sh` → recargar el navegador. Los
 tests no necesitan compilar; leen `src/` directamente.
 
-**Antes de dar algo por terminado, los cinco tests pasan.** `sim.js` lanza
+**Antes de dar algo por terminado, los siete tests pasan.** `sim.js` lanza
 excepción con posiciones `NaN` o luchadores fuera de la arena; `e2e.js` recorre
 menú, rondas, reliquias y resultado; `determinism.js` y `lint.js` protegen lo
 que costó conseguir en las etapas 1 y 2. Entre todos cogen la mayoría de las

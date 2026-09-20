@@ -33,6 +33,9 @@ function makeFighter(champId, team, isBot, name) {
 function applyRelic(f, relic) {
   f.relics.push(relic);
   relic.ap(f);
+  // Viaja por la red: las reliquias cambian velocidad, daño y recargas, así que
+  // un cliente que no supiera cuáles llevas predeciría otro movimiento.
+  emit({ e: 'relic', id: f.uid, idx: RELICS.indexOf(relic) });
 }
 
 function resetFighter(f, x, z, faceDir) {
@@ -420,7 +423,9 @@ function tickFighter(f, dt) {
     castSlow = f.casting.root ? 0 : .42;
     if (f.casting.t >= f.casting.dur) {
       const c = f.casting; f.casting = null;
-      fireAbility(f, c.i, c.ab, c.o);
+      // una canalización reconstruida de una instantánea no dispara: el efecto
+      // lo manda el servidor (ver writeFighter en 57_client.js)
+      if (!c.ghost) fireAbility(f, c.i, c.ab, c.o);
     }
   }
 

@@ -20,6 +20,8 @@ node tests/sim.js           # 12 rondas de bots 3v3, sin dobles, ~250 ms
 node tests/e2e.js           # recorrido completo: menú → rondas → reliquias → resultado
 node tests/determinism.js   # misma semilla ⇒ misma partida
 node tests/input_cmd.js     # el comando de entrada, de punta a punta
+node tests/net.js           # el protocolo de cable, de ida y vuelta
+node tests/netloop.js       # cliente y servidor con latencia y pérdida simuladas
 node tests/lint.js          # azar con semilla y frontera simulación/vista
 ```
 
@@ -54,7 +56,7 @@ No hay `package.json`, ni instalación, ni linter. Node 22 basta.
 
 ## Dónde está cada cosa
 
-**10-50 es simulación** (corre en Node tal cual), **60-80 es vista**, **90 une las dos.**
+**10-57 es simulación y red** (corre en Node tal cual), **60-80 es vista**, **90 une las dos.**
 
 | | |
 |---|---|
@@ -63,6 +65,9 @@ No hay `package.json`, ni instalación, ni linter. Node 22 basta.
 | `src/30_combat.js` | entidades, `dealDamage`, `applyCC`, `tickFighter`, primitivas, `applyInput` |
 | `src/40_ai.js` | `updateAI`, `BOT_PLANS`, `ROLE_RANGE` |
 | `src/50_match.js` | máquina de partida, rondas, reliquias, **`simStep(dt, cmd)`** |
+| `src/55_net.js` | protocolo binario: instantáneas, comandos, eventos |
+| `src/56_server.js` | servidor autoritativo (irá en un Worker o en Node) |
+| `src/57_client.js` | predicción, reconciliación e interpolación |
 | `src/00_head.html` | CSS, pantallas, HUD; abre el `<script>` |
 | `src/60_view.js` | three.js, escena, cámara, `CHAMP_MESH`, **`syncView`** |
 | `src/70_fx.js` | partículas, `SOUNDS`, `SFX`, **`drainEvents`** |
@@ -71,7 +76,7 @@ No hay `package.json`, ni instalación, ni linter. Node 22 basta.
 
 ## Antes de terminar una tarea
 
-Los cinco tests pasan. Para cambios de equilibrio, mide con `tests/sim.js`
+Los siete tests pasan. Para cambios de equilibrio, mide con `tests/sim.js`
 (edita `comp` y `SIZE` en `tests/test_drive.js`, fija `SIM_SEED` y sube a 40-60
 rondas); doce rondas son ruido.
 

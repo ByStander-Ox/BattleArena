@@ -381,9 +381,11 @@ una línea**, en Node:
 
 ```bash
 node tests/sim.js           # 12 rondas de bots 3v3, sin dobles, ~250 ms
-node tests/e2e.js           # menú → partida → rondas → reliquias → resultado
+node tests/e2e.js           # recorrido completo: menú → rondas → reliquias → resultado
 node tests/determinism.js   # misma semilla ⇒ misma partida
-node tests/input_cmd.js     # cuantización, botones y punto de apuntado
+node tests/input_cmd.js     # el comando de entrada, de punta a punta
+node tests/net.js           # el protocolo de cable, de ida y vuelta
+node tests/netloop.js       # cliente y servidor con latencia y pérdida simuladas
 node tests/lint.js          # azar con semilla y frontera simulación/vista
 ```
 

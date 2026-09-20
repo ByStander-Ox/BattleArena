@@ -59,10 +59,12 @@ para medir el equilibrio. Solo `e2e.js`, que recorre también la interfaz,
 necesita dobles de three.js y del DOM.
 
 ```bash
-node tests/sim.js           # dos equipos de bots peleando; informa de habilidades usadas
-node tests/e2e.js           # menú -> partida -> rondas -> reliquias -> resultado
-node tests/determinism.js   # misma semilla, misma partida
+node tests/sim.js           # 12 rondas de bots 3v3, sin dobles, ~250 ms
+node tests/e2e.js           # recorrido completo: menú → rondas → reliquias → resultado
+node tests/determinism.js   # misma semilla ⇒ misma partida
 node tests/input_cmd.js     # el comando de entrada, de punta a punta
+node tests/net.js           # el protocolo de cable, de ida y vuelta
+node tests/netloop.js       # cliente y servidor con latencia y pérdida simuladas
 node tests/lint.js          # azar con semilla y frontera simulación/vista
 ```
 
@@ -148,9 +150,17 @@ porque es exactamente este código**.
 De propina: el equilibrio se puede medir de verdad, y una repetición cabe en
 unos pocos kilobytes (la semilla más la lista de comandos).
 
-Lo siguiente es la etapa 3, que mueve la simulación a un Web Worker con el mismo
-protocolo que usará el servidor, para depurar predicción y reconciliación sin
-servidor de por medio.
+**Y el núcleo de la etapa 3 también.** Existen ya el protocolo binario (183 B
+por instantánea de 3v3, 3,6 KB/s), el servidor autoritativo y el cliente con
+predicción, reconciliación e interpolación. `tests/netloop.js` los enfrenta en
+dos contextos aislados a través de una red con latencia, fluctuación y pérdida
+simuladas, y mide lo único que se puede medir sin jugar: **la posición que
+predice el cliente contra la que saca el servidor**. Coinciden, y la
+reconciliación se queda en los 2 mm de la cuantización incluso con 250 ms de
+latencia y una de cada ocho tramas perdida.
+
+Falta enchufarlo al navegador: mudar el servidor a un Web Worker y darle al menú
+una opción para jugar contra él. Hasta entonces el juego sigue siendo local.
 
 ## Lo que no está
 
