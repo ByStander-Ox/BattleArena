@@ -341,8 +341,6 @@ const dist2 = (ax, az, bx, bz) => { const dx = ax - bx, dz = az - bz; return dx 
 const dist = (ax, az, bx, bz) => Math.sqrt(dist2(ax, az, bx, bz));
 const angDiff = (a, b) => { let d = (a - b) % TAU; if (d > Math.PI) d -= TAU; if (d < -Math.PI) d += TAU; return d; };
 const damp = (rate, dt) => 1 - Math.pow(rate, dt);
-const $ = id => document.getElementById(id);
-const el = (tag, cls, html) => { const e = document.createElement(tag); if (cls) e.className = cls; if (html != null) e.innerHTML = html; return e; };
 /* Punto plano, no THREE.Vector3: el estado de juego no debe depender de tipos
    de la capa de render, y así se puede serializar con JSON.stringify. */
 const vec3 = (x, y, z) => ({ x: x || 0, y: y || 0, z: z || 0 });
@@ -443,12 +441,13 @@ function segHitsPillar(x1, z1, x2, z2, radius) {
 const G = {
   state: 'title',          // title | setup | intro | live | roundend | brite | result | pause
   mode: null, diff: null,
-  fighters: [], projectiles: [], zones: [], pickups: [], fx: [],
+  fighters: [], projectiles: [], zones: [], pickups: [],
   byId: new Map(),         // uid -> luchador; las entidades se refieren por id
+  events: [],              // lo ocurrido en el paso, para que lo lea la vista
   player: null, t: 0, dt: 0, paused: false,
   round: 1, score: [0, 0], roundTime: 0, sudden: false, shrink: 1,
   picks: 0, timeScale: 1, nextOrb: 0, nextHeal: 0, started: false,
-  firstBlood: false, announceT: 0, camShake: 0, quality: 1, order: 0,
+  firstBlood: false, order: 0, relicOptions: null,
   seed: 0                  // semilla de la partida: basta para repetirla entera
 };
 const fighterById = id => G.byId.get(id) || null;
@@ -478,342 +477,35 @@ const DIFFS = {
   elite: { id: 'elite', name: 'Leyenda', react: .07, aimErr: .045, dodge: .88, aggr: 1, exUse: .95 }
 };
 
-/* ============================ motor ============================ */
-let renderer, scene, camera, clock, floorMesh, ringMesh, sdRing, embers;
-const CAM = { tilt: 0.985, dist: 46, follow: false, tgt: new THREE.Vector3(), shake: new THREE.Vector3() };
-const tmpV = new THREE.Vector3(), tmpV2 = new THREE.Vector3();
+/* ============================ eventos ============================ */
+/* La simulación no dibuja ni suena: anota lo que ha pasado y sigue. La vista
+   vacía la cola cada fotograma y decide qué hacer con cada anotación.
 
-function initEngine() {
-  const canvas = $('gl');
-  renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: 'high-performance' });
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
-  renderer.shadowMap.enabled = true;
-  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
-  if (THREE.sRGBEncoding) renderer.outputEncoding = THREE.sRGBEncoding;
-  scene = new THREE.Scene();
-  scene.background = new THREE.Color(0x05070d);
-  scene.fog = new THREE.Fog(0x05070d, 52, 108);
-  camera = new THREE.PerspectiveCamera(40, 1, 1, 260);
-  clock = new THREE.Clock();
-  buildLights();
-  buildArena();
-  buildEmbers();
-  window.addEventListener('resize', onResize);
-  onResize();
-}
+   Es lo que permite que este mismo código corra en un servidor sin escena ni
+   audio, y lo que viajará por la red cuando exista el modo online: por eso los
+   eventos llevan identificadores y números, nunca referencias a objetos ni
+   texto ya compuesto. Quien decide que «Vesk elimina a Brakk» se lee así es la
+   vista, a partir de `{e:'kill', id, byId}`. */
+function emit(ev) { G.events.push(ev); return ev; }
 
-function buildLights() {
-  scene.add(new THREE.HemisphereLight(0x6f84bd, 0x1a1108, 0.55));
-  const sun = new THREE.DirectionalLight(0xffe9c4, 1.05);
-  sun.position.set(16, 34, 14);
-  sun.castShadow = true;
-  sun.shadow.mapSize.set(2048, 2048);
-  const c = sun.shadow.camera;
-  c.left = -26; c.right = 26; c.top = 24; c.bottom = -24; c.near = 4; c.far = 90;
-  sun.shadow.bias = -0.0012;
-  scene.add(sun);
-  const warm = new THREE.PointLight(0xff7a28, 1.5, 44, 2);
-  warm.position.set(-22, 6, 0); scene.add(warm);
-  const cool = new THREE.PointLight(0x4f86ff, 1.2, 44, 2);
-  cool.position.set(22, 6, 0); scene.add(cool);
-}
+const sfx = id => emit({ e: 'sfx', id });
+const fxNum = (p, text, cls) => emit({ e: 'num', x: p.x, z: p.z, text, cls });
+const fxHit = (x, z, col) => emit({ e: 'hit', x, z, col });
+const fxPuff = (p, col, n, scale) => emit({ e: 'puff', x: p.x, y: p.y || 0, z: p.z, col, n, scale });
+const fxRing = (p, radius, col) => emit({ e: 'ring', x: p.x, z: p.z, radius, col });
+const fxArc = (p, a0, half, range, col) => emit({ e: 'arc', x: p.x, z: p.z, a0, half, range, col });
+const fxShake = a => emit({ e: 'shake', a });
 
-function roundedRectShape(hx, hz, r) {
-  const s = new THREE.Shape();
-  const x = hx - r, z = hz - r;
-  s.moveTo(-x, -hz);
-  s.lineTo(x, -hz);
-  s.absarc(x, -z, r, -Math.PI / 2, 0, false);
-  s.lineTo(hx, z);
-  s.absarc(x, z, r, 0, Math.PI / 2, false);
-  s.lineTo(-x, hz);
-  s.absarc(-x, z, r, Math.PI / 2, Math.PI, false);
-  s.lineTo(-hx, -z);
-  s.absarc(-x, -z, r, Math.PI, Math.PI * 1.5, false);
-  s.closePath();
-  return s;
-}
-
-function floorTexture() {
-  const S = 1024, cv = document.createElement('canvas');
-  cv.width = cv.height = S;
-  const g = cv.getContext('2d');
-  g.fillStyle = '#2b2f3c'; g.fillRect(0, 0, S, S);
-  // veteado de piedra
-  for (let i = 0; i < 2600; i++) {
-    const x = frand() * S, y = frand() * S, r = frand() * 46 + 6;
-    g.fillStyle = `rgba(${140 + firnd(50)},${138 + firnd(46)},${150 + firnd(50)},${0.018 + frand() * 0.04})`;
-    g.beginPath(); g.arc(x, y, r, 0, TAU); g.fill();
-  }
-  // losas
-  g.strokeStyle = 'rgba(8,10,16,.55)'; g.lineWidth = 3;
-  const cell = S / 16;
-  for (let i = 1; i < 16; i++) {
-    g.beginPath(); g.moveTo(i * cell, 0); g.lineTo(i * cell, S); g.stroke();
-    g.beginPath(); g.moveTo(0, i * cell); g.lineTo(S, i * cell); g.stroke();
-  }
-  // grietas
-  g.strokeStyle = 'rgba(6,8,12,.5)'; g.lineWidth = 2;
-  for (let i = 0; i < 26; i++) {
-    g.beginPath();
-    let x = frand() * S, y = frand() * S;
-    g.moveTo(x, y);
-    for (let k = 0; k < 7; k++) { x += frnd(-70, 70); y += frnd(-70, 70); g.lineTo(x, y); }
-    g.stroke();
-  }
-  // círculos centrales
-  const cx = S / 2;
-  g.strokeStyle = 'rgba(229,167,67,.30)'; g.lineWidth = 5;
-  g.beginPath(); g.arc(cx, cx, 150, 0, TAU); g.stroke();
-  g.lineWidth = 2.5;
-  g.beginPath(); g.arc(cx, cx, 176, 0, TAU); g.stroke();
-  g.strokeStyle = 'rgba(229,167,67,.2)';
-  for (let i = 0; i < 12; i++) {
-    const a = i / 12 * TAU;
-    g.beginPath();
-    g.moveTo(cx + Math.cos(a) * 152, cx + Math.sin(a) * 152);
-    g.lineTo(cx + Math.cos(a) * 174, cx + Math.sin(a) * 174);
-    g.stroke();
-  }
-  // emblema: dos hojas cruzadas estilizadas
-  g.save(); g.translate(cx, cx); g.strokeStyle = 'rgba(229,167,67,.34)'; g.lineWidth = 9; g.lineCap = 'round';
-  for (const a of [Math.PI / 4, -Math.PI / 4]) {
-    g.save(); g.rotate(a);
-    g.beginPath(); g.moveTo(-96, 0); g.lineTo(96, 0); g.stroke();
-    g.beginPath(); g.moveTo(70, -22); g.lineTo(96, 0); g.lineTo(70, 22); g.stroke();
-    g.restore();
-  }
-  g.restore();
-  // zonas de aparición
-  const paint = (px, col) => {
-    const grd = g.createRadialGradient(px, cx, 10, px, cx, 130);
-    grd.addColorStop(0, col); grd.addColorStop(1, 'rgba(0,0,0,0)');
-    g.fillStyle = grd; g.beginPath(); g.arc(px, cx, 130, 0, TAU); g.fill();
-  };
-  paint(96, 'rgba(74,158,240,.26)');
-  paint(S - 96, 'rgba(232,87,76,.26)');
-  const tex = new THREE.CanvasTexture(cv);
-  if (THREE.sRGBEncoding) tex.encoding = THREE.sRGBEncoding;
-  tex.anisotropy = renderer.capabilities.getMaxAnisotropy ? renderer.capabilities.getMaxAnisotropy() : 4;
-  return tex;
-}
-
-function buildArena() {
-  const shape = roundedRectShape(ARENA.hx, ARENA.hz, ARENA.r);
-  const geo = new THREE.ExtrudeGeometry(shape, { depth: 3.2, bevelEnabled: true, bevelThickness: .28, bevelSize: .34, bevelSegments: 2, curveSegments: 20 });
-  geo.rotateX(-Math.PI / 2);
-  geo.computeBoundingBox();
-  const bb = geo.boundingBox;
-  geo.translate(0, -bb.max.y, 0);          // la cara superior queda a ras de y = 0
-  const uv = geo.attributes.uv, pos = geo.attributes.position;
-  for (let i = 0; i < uv.count; i++) {
-    uv.setXY(i, (pos.getX(i) - bb.min.x) / (bb.max.x - bb.min.x), (pos.getZ(i) - bb.min.z) / (bb.max.z - bb.min.z));
-  }
-  const mat = new THREE.MeshStandardMaterial({ map: floorTexture(), roughness: .92, metalness: .06 });
-  floorMesh = new THREE.Mesh(geo, mat);
-  floorMesh.position.y = -0.03;
-  floorMesh.receiveShadow = true;
-  scene.add(floorMesh);
-
-  // borde luminoso
-  const pts = shape.getPoints(140).map(p => new THREE.Vector3(p.x, 0.07, -p.y));
-  pts.push(pts[0].clone());
-  const lg = new THREE.BufferGeometry().setFromPoints(pts);
-  ringMesh = new THREE.Line(lg, new THREE.LineBasicMaterial({ color: 0xe5a743, transparent: true, opacity: .85 }));
-  scene.add(ringMesh);
-  const lg2 = lg.clone(); lg2.translate(0, -0.55, 0);
-  scene.add(new THREE.Line(lg2, new THREE.LineBasicMaterial({ color: 0xff7a28, transparent: true, opacity: .32 })));
-
-  // anillo de muerte súbita: mismo contorno, escalado
-  const sdPts = shape.getPoints(120).map(p => new THREE.Vector3(p.x, 0, -p.y));
-  sdPts.push(sdPts[0].clone());
-  sdRing = new THREE.Line(new THREE.BufferGeometry().setFromPoints(sdPts),
-    new THREE.LineBasicMaterial({ color: 0xff5530, transparent: true, opacity: .9 }));
-  sdRing.position.y = 0.14; sdRing.visible = false;
-  scene.add(sdRing);
-
-  // pilares
-  ARENA.pillars = [{ x: -8.6, z: -4.9, r: 1.45 }, { x: 8.6, z: -4.9, r: 1.45 }, { x: -8.6, z: 4.9, r: 1.45 }, { x: 8.6, z: 4.9, r: 1.45 }];
-  const pgeo = new THREE.CylinderGeometry(1.2, 1.5, 4.6, 12, 1);
-  const pmat = new THREE.MeshStandardMaterial({ color: 0x39405a, roughness: .8, metalness: .18 });
-  const rgeo = new THREE.TorusGeometry(1.34, .07, 6, 18);
-  const rmat = new THREE.MeshBasicMaterial({ color: 0xe5a743, transparent: true, opacity: .6 });
-  for (const p of ARENA.pillars) {
-    const m = new THREE.Mesh(pgeo, pmat);
-    m.position.set(p.x, 2.3, p.z); m.castShadow = true; m.receiveShadow = true; scene.add(m);
-    for (const y of [1.2, 3.4]) {
-      const r = new THREE.Mesh(rgeo, rmat);
-      r.rotation.x = Math.PI / 2; r.position.set(p.x, y, p.z); scene.add(r);
-    }
-  }
-  // rocas flotantes de ambiente
-  const rock = new THREE.MeshStandardMaterial({ color: 0x1b2030, roughness: 1 });
-  for (let i = 0; i < 14; i++) {
-    const s = frnd(1.2, 4.2);
-    const m = new THREE.Mesh(new THREE.DodecahedronGeometry(s, 0), rock);
-    const a = frand() * TAU, d = frnd(26, 48);
-    m.position.set(Math.cos(a) * d, frnd(-14, -3), Math.sin(a) * d * .8);
-    m.rotation.set(frand() * 3, frand() * 3, frand() * 3);
-    scene.add(m);
-  }
-}
-
-function buildEmbers() {
-  const N = 320, pos = new Float32Array(N * 3), spd = new Float32Array(N);
-  for (let i = 0; i < N; i++) {
-    pos[i * 3] = frnd(-26, 26); pos[i * 3 + 1] = frnd(-6, 20); pos[i * 3 + 2] = frnd(-20, 20);
-    spd[i] = frnd(.5, 2.1);
-  }
-  const g = new THREE.BufferGeometry();
-  g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
-  embers = new THREE.Points(g, new THREE.PointsMaterial({ color: 0xff9a45, size: .17, transparent: true, opacity: .55, blending: THREE.AdditiveBlending, depthWrite: false }));
-  embers.userData.spd = spd;
-  scene.add(embers);
-}
-
-function updateEmbers(dt) {
-  const p = embers.geometry.attributes.position, spd = embers.userData.spd;
-  for (let i = 0; i < spd.length; i++) {
-    let y = p.getY(i) + spd[i] * dt;
-    if (y > 21) { y = -7; p.setX(i, frnd(-26, 26)); p.setZ(i, frnd(-20, 20)); }
-    p.setY(i, y);
-  }
-  p.needsUpdate = true;
-}
-
-/* ============================ cámara ============================ */
-function fitCamera() {
-  const corners = [[-ARENA.hx, -ARENA.hz], [ARENA.hx, -ARENA.hz], [ARENA.hx, ARENA.hz], [-ARENA.hx, ARENA.hz]];
-  let d = 30;
-  const test = new THREE.Vector3();
-  for (let i = 0; i < 60; i++) {
-    camera.position.set(0, d * Math.sin(CAM.tilt), d * Math.cos(CAM.tilt));
-    camera.lookAt(0, 0, 0);
-    camera.updateMatrixWorld(true); camera.updateProjectionMatrix();
-    let ok = true;
-    for (const c of corners) {
-      test.set(c[0], 1.2, c[1]).project(camera);
-      if (Math.abs(test.x) > .96 || Math.abs(test.y) > .93) { ok = false; break; }
-    }
-    if (ok) break;
-    d *= 1.045;
-  }
-  CAM.follow = d > 64;
-  CAM.dist = CAM.follow ? 42 : d;
-}
-
-function onResize() {
-  const w = window.innerWidth, h = window.innerHeight;
-  renderer.setSize(w, h, false);
-  camera.aspect = w / h;
-  camera.updateProjectionMatrix();
-  fitCamera();
-  document.body.classList.toggle('portrait', h > w);
-}
-
-function updateCamera(dt) {
-  let tx = 0, tz = 0;
-  if (CAM.follow && G.player) {
-    tx = clamp(G.player.pos.x * .62, -9.5, 9.5);
-    tz = clamp(G.player.pos.z * .55, -6, 6);
-  }
-  const k = damp(0.002, dt);
-  CAM.tgt.x = lerp(CAM.tgt.x, tx, k);
-  CAM.tgt.z = lerp(CAM.tgt.z, tz, k);
-  if (G.camShake > 0) {
-    G.camShake = Math.max(0, G.camShake - dt * 2.4);
-    const s = G.camShake * G.camShake * 1.5;
-    CAM.shake.set(frnd(-s, s), frnd(-s, s), frnd(-s, s));
-  } else CAM.shake.set(0, 0, 0);
-  camera.position.set(
-    CAM.tgt.x + CAM.shake.x,
-    CAM.dist * Math.sin(CAM.tilt) + CAM.shake.y,
-    CAM.tgt.z + CAM.dist * Math.cos(CAM.tilt) + CAM.shake.z);
-  camera.lookAt(CAM.tgt.x, 0, CAM.tgt.z);
-}
-function shake(a) { G.camShake = Math.min(1.6, G.camShake + a); }
-
-/* ============================ entrada ============================ */
-const Input = {
-  keys: Object.create(null), mouse: { x: 0, y: 0 }, m1: false, m2: false, shift: false,
-  aim: new THREE.Vector3(1, 0, 0), aimDir: { x: 1, z: 0 },
-  touch: false, moveVec: { x: 0, z: 0 }, tAim: { x: 0, z: 0 }, tFire: false,
-  queued: null
-};
-const _ray = new THREE.Raycaster(), _plane = new THREE.Plane(new THREE.Vector3(0, 1, 0), -1.0), _ndc = new THREE.Vector2();
-
-function screenToGround(cx, cy, out) {
-  _ndc.set((cx / window.innerWidth) * 2 - 1, -(cy / window.innerHeight) * 2 + 1);
-  _ray.setFromCamera(_ndc, camera);
-  if (!_ray.ray.intersectPlane(_plane, out)) out.set(0, 1, 0);
-  return out;
-}
-
-function initInput() {
-  addEventListener('keydown', e => {
-    const k = e.key.toLowerCase();
-    if (k === 'shift') Input.shift = true;
-    Input.keys[k] = true;
-    if (k === 'escape') { e.preventDefault(); togglePause(); }
-    if ([' ', 'q', 'e', 'r', 'f', 'w', 'a', 's', 'd'].includes(k)) e.preventDefault();
-  });
-  addEventListener('keyup', e => {
-    const k = e.key.toLowerCase();
-    if (k === 'shift') Input.shift = false;
-    Input.keys[k] = false;
-  });
-  addEventListener('blur', () => { Input.keys = Object.create(null); Input.m1 = Input.m2 = false; });
-  const cv = $('gl');
-  cv.addEventListener('contextmenu', e => e.preventDefault());
-  addEventListener('pointermove', e => {
-    if (e.pointerType === 'touch') return;
-    Input.mouse.x = e.clientX; Input.mouse.y = e.clientY;
-  });
-  cv.addEventListener('pointerdown', e => {
-    if (e.pointerType === 'touch') return;
-    if (e.button === 0) Input.m1 = true;
-    if (e.button === 2) Input.m2 = true;
-  });
-  addEventListener('pointerup', e => {
-    if (e.pointerType === 'touch') return;
-    if (e.button === 0) Input.m1 = false;
-    if (e.button === 2) Input.m2 = false;
-  });
-  Input.touch = matchMedia('(pointer:coarse)').matches;
-  if (Input.touch) initTouch();
-}
-
-function updateAim() {
-  if (Input.touch && (Input.tAim.x || Input.tAim.z)) {
-    Input.aimDir.x = Input.tAim.x; Input.aimDir.z = Input.tAim.z;
-    if (G.player) Input.aim.set(G.player.pos.x + Input.tAim.x * 12, 1, G.player.pos.z + Input.tAim.z * 12);
-    return;
-  }
-  screenToGround(Input.mouse.x, Input.mouse.y, Input.aim);
-  if (G.player) {
-    const dx = Input.aim.x - G.player.pos.x, dz = Input.aim.z - G.player.pos.z;
-    const d = Math.hypot(dx, dz) || 1;
-    Input.aimDir.x = dx / d; Input.aimDir.z = dz / d;
-  }
-}
-
-function moveInput() {
-  if (Input.touch) return { x: Input.moveVec.x, z: Input.moveVec.z };
-  let x = 0, z = 0;
-  if (Input.keys['w'] || Input.keys['arrowup']) z -= 1;
-  if (Input.keys['s'] || Input.keys['arrowdown']) z += 1;
-  if (Input.keys['a'] || Input.keys['arrowleft']) x -= 1;
-  if (Input.keys['d'] || Input.keys['arrowright']) x += 1;
-  const d = Math.hypot(x, z);
-  return d > 0 ? { x: x / d, z: z / d } : { x: 0, z: 0 };
-}
-
-/* ---- comando de entrada ---- */
+/* ============================ comando de entrada ============================ */
 /* La entrada entra en la simulación como un dato plano, nunca leyendo el
    teclado desde dentro del bucle. Así se puede guardar, enviar por la red y
    volver a aplicar, que es justo lo que hará la reconciliación del cliente
    cuando exista el modo online; y de paso una repetición pasa a ser la semilla
    más la lista de comandos.
+
+   El formato es contrato de simulación, no de interfaz: `applyInput` lo
+   consume y un servidor lo recibirá por la red. Quien lo produce leyendo el
+   teclado es la vista.
 
    Las direcciones van cuantizadas a 256 pasos (1,4°) y la distancia de
    apuntado a decímetros: sobra para un proyectil de radio 0,3 a 26 m, y deja
@@ -827,137 +519,13 @@ function byteToDir(b, out) {
   out.x = Math.sin(a); out.z = Math.cos(a);
   return out;
 }
-
-function sampleInput(seq) {
-  updateAim();
-  const f = G.player;
-  const mv = moveInput();
-  const dx = Input.aim.x - (f ? f.pos.x : 0), dz = Input.aim.z - (f ? f.pos.z : 0);
-  let buttons = 0, ex = Input.shift || Input.exMode;
-  if (Input.queued) {
-    buttons |= 1 << Input.queued.i;
-    if (Input.queued.ex) ex = true;
-    Input.queued = null;
-    if (Input.exMode) { Input.exMode = false; syncEx(); }
-  }
-  if (Input.m1 || (Input.touch && Input.tFire)) buttons |= BTN.M1;
-  if (Input.m2) buttons |= BTN.M2;
-  if (Input.keys[' ']) buttons |= BTN.SP;
-  if (Input.keys['q']) buttons |= BTN.Q;
-  if (Input.keys['e']) buttons |= BTN.E;
-  if (Input.keys['f']) buttons |= BTN.F;
-  if (Input.keys['r']) buttons |= BTN.R;
-  return {
-    seq,
-    move: (mv.x || mv.z) ? dirToByte(mv.x, mv.z) : CMD_STILL,
-    aim: dirToByte(Input.aimDir.x, Input.aimDir.z),
-    aimD: clamp(Math.round(Math.hypot(dx, dz) * 10), 0, 255),
-    buttons, ex: ex ? 1 : 0
-  };
-}
-
-/* --- controles táctiles --- */
-function initTouch() {
-  $('touch').classList.remove('hidden');
-  const mk = (node, onMove, onEnd) => {
-    let id = null; const R = 52;
-    const nub = node.querySelector('.nub');
-    const rect = () => node.getBoundingClientRect();
-    node.addEventListener('pointerdown', e => {
-      if (id !== null) return;
-      id = e.pointerId; node.setPointerCapture(id); handle(e);
-    });
-    node.addEventListener('pointermove', e => { if (e.pointerId === id) handle(e); });
-    const up = e => {
-      if (e.pointerId !== id) return;
-      id = null; nub.style.transform = '';
-      onMove(0, 0); if (onEnd) onEnd();
-    };
-    node.addEventListener('pointerup', up);
-    node.addEventListener('pointercancel', up);
-    function handle(e) {
-      const r = rect();
-      let dx = e.clientX - (r.left + r.width / 2), dy = e.clientY - (r.top + r.height / 2);
-      const d = Math.hypot(dx, dy);
-      const k = d > R ? R / d : 1;
-      nub.style.transform = `translate(${dx * k}px,${dy * k}px)`;
-      const n = Math.max(d, 1);
-      onMove(dx / n * Math.min(1, d / R), dy / n * Math.min(1, d / R));
-    }
-  };
-  mk($('stick-l'), (x, y) => { Input.moveVec.x = x; Input.moveVec.z = y; });
-  mk($('stick-r'), (x, y) => {
-    const d = Math.hypot(x, y);
-    if (d > .25) { Input.tAim.x = x / d; Input.tAim.z = y / d; Input.tFire = true; }
-    else Input.tFire = false;
-  }, () => { Input.tFire = false; });
-}
-
-/* ============================ sonido ============================ */
-const SFX = {
-  ctx: null, gain: null, on: true,
-  init() {
-    if (this.ctx) return;
-    const AC = window.AudioContext || window.webkitAudioContext;
-    if (!AC) return;
-    this.ctx = new AC();
-    this.gain = this.ctx.createGain();
-    this.gain.gain.value = .22;
-    this.gain.connect(this.ctx.destination);
-  },
-  tone(f0, f1, dur, type, vol, delay) {
-    if (!this.on || !this.ctx) return;
-    const t = this.ctx.currentTime + (delay || 0);
-    const o = this.ctx.createOscillator(), g = this.ctx.createGain();
-    o.type = type || 'square';
-    o.frequency.setValueAtTime(f0, t);
-    o.frequency.exponentialRampToValueAtTime(Math.max(30, f1), t + dur);
-    g.gain.setValueAtTime(0, t);
-    g.gain.linearRampToValueAtTime(vol == null ? .5 : vol, t + .008);
-    g.gain.exponentialRampToValueAtTime(.0008, t + dur);
-    o.connect(g); g.connect(this.gain);
-    o.start(t); o.stop(t + dur + .03);
-  },
-  noise(dur, vol, hp) {
-    if (!this.on || !this.ctx) return;
-    const n = Math.floor(this.ctx.sampleRate * dur);
-    const buf = this.ctx.createBuffer(1, n, this.ctx.sampleRate);
-    const d = buf.getChannelData(0);
-    for (let i = 0; i < n; i++) d[i] = (frand() * 2 - 1) * (1 - i / n);   /* ruido: presentación */
-    const s = this.ctx.createBufferSource(); s.buffer = buf;
-    const f = this.ctx.createBiquadFilter(); f.type = 'highpass'; f.frequency.value = hp || 600;
-    const g = this.ctx.createGain(); g.gain.value = vol == null ? .3 : vol;
-    s.connect(f); f.connect(g); g.connect(this.gain); s.start();
-  },
-  shot() { this.tone(760, 320, .09, 'square', .18); },
-  hit() { this.tone(200, 90, .12, 'sawtooth', .22); this.noise(.07, .12, 900); },
-  big() { this.tone(160, 48, .34, 'sawtooth', .3); this.noise(.2, .2, 300); },
-  heal() { this.tone(520, 880, .2, 'sine', .2); },
-  dash() { this.noise(.18, .16, 1400); },
-  cast() { this.tone(300, 620, .12, 'triangle', .15); },
-  ult() { this.tone(120, 500, .5, 'sawtooth', .28); this.tone(240, 1000, .5, 'square', .12, .05); },
-  die() { this.tone(300, 60, .5, 'sawtooth', .26); },
-  orb() { this.tone(660, 1320, .16, 'sine', .2); },
-  round() { this.tone(392, 392, .16, 'triangle', .26); this.tone(523, 523, .16, 'triangle', .26, .16); this.tone(784, 784, .3, 'triangle', .3, .32); },
-  win() { [523, 659, 784, 1046].forEach((f, i) => this.tone(f, f, .3, 'triangle', .26, i * .12)); },
-  lose() { [440, 370, 294, 220].forEach((f, i) => this.tone(f, f, .34, 'sine', .24, i * .14)); },
-  tick() { this.tone(900, 900, .06, 'square', .14); }
-};
 /* ============================ campeones ============================ */
 /* Cada kit: M1 básico · M2/Q/E/F habilidades (versión mejorada con Shift) ·
-   Espacio desplazamiento · R definitiva (100 de energía).                  */
+   Espacio desplazamiento · R definitiva (100 de energía).
 
-const MAT = (c, o) => new THREE.MeshStandardMaterial(Object.assign({ color: c, roughness: .68, metalness: .12 }, o || {}));
-
-function limb(g, geo, mat, x, y, z, rx, rz) {
-  const m = new THREE.Mesh(geo, mat);
-  m.position.set(x, y, z);
-  if (rx) m.rotation.x = rx;
-  if (rz) m.rotation.z = rz;
-  m.castShadow = true;
-  g.add(m);
-  return m;
-}
+   Aquí solo hay reglas y números: nada de mallas ni de audio. Las mallas de
+   cada campeón viven en 60_view.js (`CHAMP_MESH`) y los sonidos salen como
+   eventos `sfx('nombre')` que 70_fx.js traduce a osciladores.              */
 
 const CHAMPS = {
   /* ------------------------------------------------ VESK ------------- */
@@ -965,22 +533,11 @@ const CHAMPS = {
     id: 'vesk', name: 'Vesk', title: 'la Cazadora', role: 'Tirador', glyph: '🏹',
     color: 0x5ddba6, hp: 100, speed: 7.3, stats: { atk: 4, def: 2, mob: 4 },
     blurb: 'Castiga a distancia y rompe la formación con trampas y patadas al vacío.',
-    build(g) {
-      const cloth = MAT(0x2f6d56), skin = MAT(0xdfb894), dark = MAT(0x1d2b28);
-      limb(g, new THREE.CylinderGeometry(.3, .44, 1.0, 10), cloth, 0, .6, 0);
-      limb(g, new THREE.SphereGeometry(.27, 14, 12), skin, 0, 1.32, 0);
-      const hood = limb(g, new THREE.ConeGeometry(.36, .5, 10), cloth, 0, 1.46, -.05);
-      hood.rotation.x = -.12;
-      limb(g, new THREE.BoxGeometry(.1, .62, .1), dark, .42, 1.0, .12, .35, .5);
-      const bow = limb(g, new THREE.TorusGeometry(.42, .05, 5, 12, Math.PI * 1.15), dark, .46, .98, .2);
-      bow.rotation.set(Math.PI / 2, 0, .4);
-      return g;
-    },
     ab: [
       {
         k: 'M1', n: 'Virote', g: '🏹', cd: .5, wind: .07, hold: true,
         d: 'Dispara un virote rápido. 8 de daño.',
-        act(f, o) { shoot(f, { dir: o.aim, speed: 38, dmg: 8, radius: .3, range: 26, color: 0xbff3d6, kb: 1.4 }); SFX.shot(); }
+        act(f, o) { shoot(f, { dir: o.aim, speed: 38, dmg: 8, radius: .3, range: 26, color: 0xbff3d6, kb: 1.4 }); sfx('shot'); }
       },
       {
         k: 'M2', n: 'Saeta perforante', g: '🎯', cd: 5, wind: .22, exCost: 50,
@@ -991,13 +548,13 @@ const CHAMPS = {
             dir: o.aim, speed: 31, dmg: o.ex ? 21 : 17, radius: .45, range: 28, pierce: true,
             color: o.ex ? 0xffe27a : 0x9ef0c4, kb: 2, cc: o.ex ? 'root' : null, ccT: .8, scale: 1.5
           });
-          SFX.tone(520, 200, .18, 'sawtooth', .22);
+          sfx('pierce');
         }
       },
       {
         k: 'SP', n: 'Voltereta', g: '🌀', cd: 7.5, wind: 0, dashAb: true,
         d: 'Rueda 8 m en la dirección de movimiento. Inmune mientras ruedas.',
-        act(f, o) { startDash(f, { dir: o.move || o.aim, dist: 8.4, dur: .26, invuln: .2 }); SFX.dash(); }
+        act(f, o) { startDash(f, { dir: o.move || o.aim, dist: 8.4, dur: .26, invuln: .2 }); sfx('dash'); }
       },
       {
         k: 'Q', n: 'Red de acero', g: '🕸️', cd: 10, wind: .2, exCost: 50, ground: 13,
@@ -1008,7 +565,7 @@ const CHAMPS = {
             x: o.pt.x, z: o.pt.z, radius: o.ex ? 3.3 : 2.6, dur: 9, delay: .45, trap: true,
             color: 0x9ef0c4, dmg: 6, cc: 'root', ccT: o.ex ? 2.2 : 1.4
           });
-          SFX.cast();
+          sfx('cast');
         }
       },
       {
@@ -1017,8 +574,8 @@ const CHAMPS = {
         dx: 'Mejorada: además te libera de control y cura 14.',
         act(f, o) {
           buff(f, { haste: .35, hasteT: 3.2, evade: 3.2, cleanse: o.ex, heal: o.ex ? 14 : 0 });
-          puff(f.pos, 0x9fb0c8, 22);
-          SFX.noise(.3, .18, 400);
+          fxPuff(f.pos, 0x9fb0c8, 22);
+          sfx('smoke');
         }
       },
       {
@@ -1027,7 +584,7 @@ const CHAMPS = {
         dx: 'Mejorada: empuje mucho mayor. Perfecta para lanzar al vacío.',
         act(f, o) {
           meleeArc(f, { dir: o.aim, range: 3.6, arc: 85, dmg: 9, kb: o.ex ? 23 : 13, cc: 'stun', ccT: o.ex ? .6 : .35, color: 0xd8ffe9 });
-          SFX.hit();
+          sfx('hit');
         }
       },
       {
@@ -1038,7 +595,7 @@ const CHAMPS = {
             x: o.pt.x, z: o.pt.z, radius: 5.2, dur: 3, tick: .32, tickDmg: 6,
             slow: .3, color: 0x7de0b0, rain: true
           });
-          SFX.ult();
+          sfx('ult');
         }
       }
     ]
@@ -1049,17 +606,6 @@ const CHAMPS = {
     id: 'brakk', name: 'Brakk', title: 'el Yunque', role: 'Vanguardia', glyph: '⚔️',
     color: 0xd98b4a, hp: 130, speed: 7.05, stats: { atk: 3, def: 5, mob: 2 },
     blurb: 'Aguanta el castigo, descoloca al enemigo y lo arrastra donde quiere pelear.',
-    build(g) {
-      const iron = MAT(0x7a5236, { metalness: .35, roughness: .6 }), skin = MAT(0xc9a07c), dark = MAT(0x39332c);
-      g.scale.setScalar(1.16);
-      limb(g, new THREE.CylinderGeometry(.42, .5, 1.05, 10), iron, 0, .62, 0);
-      limb(g, new THREE.SphereGeometry(.28, 14, 12), skin, 0, 1.36, 0);
-      limb(g, new THREE.SphereGeometry(.25, 10, 8), iron, .48, 1.08, 0);
-      limb(g, new THREE.SphereGeometry(.25, 10, 8), iron, -.48, 1.08, 0);
-      limb(g, new THREE.BoxGeometry(.12, .9, .12), dark, .6, .78, .22, .5);
-      limb(g, new THREE.BoxGeometry(.42, .34, .5), dark, .72, 1.18, .42);
-      return g;
-    },
     ab: [
       {
         k: 'M1', n: 'Tajo', g: '⚔️', cd: .62, wind: .1, hold: true, combo: 3,
@@ -1067,7 +613,7 @@ const CHAMPS = {
         act(f, o) {
           const third = f.combo === 2;
           meleeArc(f, { dir: o.aim, range: 3.5, arc: 115, dmg: third ? 16 : 9, kb: third ? 7 : 1.5, color: 0xffcf9a });
-          SFX.tone(third ? 260 : 380, 150, .1, 'square', .18);
+          sfx(third ? 'slash3' : 'slash');
         }
       },
       {
@@ -1079,7 +625,7 @@ const CHAMPS = {
             dir: o.aim, speed: 26, dmg: 13, radius: 1.25, range: 11, pierce: true, kb: 9,
             cc: o.ex ? 'stun' : null, ccT: .55, color: o.ex ? 0xffd37a : 0xffa35c, scale: 2.4, flat: true
           });
-          SFX.big(); shake(.25);
+          sfx('big'); fxShake(.25);
         }
       },
       {
@@ -1087,7 +633,7 @@ const CHAMPS = {
         d: 'Cargas 13 m. Al primer enemigo: 10 de daño y aturde 0,75 s.',
         act(f, o) {
           startDash(f, { dir: o.move || o.aim, dist: 13, dur: .36, dmg: 10, cc: 'stun', ccT: .75, stopOnHit: true, trail: 0xffa35c });
-          SFX.tone(140, 300, .3, 'sawtooth', .22);
+          sfx('charge');
         }
       },
       {
@@ -1096,8 +642,8 @@ const CHAMPS = {
         dx: 'Mejorada: además empuja hacia fuera.',
         act(f, o) {
           radial(f, { radius: 4.6, dmg: 12, slow: .45, slowT: 2.2, kb: o.ex ? 10 : 0, color: 0xffa35c });
-          ringFx(f.pos, 4.6, 0xffa35c);
-          SFX.big(); shake(.3);
+          fxRing(f.pos, 4.6, 0xffa35c);
+          sfx('big'); fxShake(.3);
         }
       },
       {
@@ -1106,7 +652,7 @@ const CHAMPS = {
         dx: 'Mejorada: cura 16 y te libera de control.',
         act(f, o) {
           buff(f, { shield: 38, dr: .25, drT: 4, heal: o.ex ? 16 : 0, cleanse: o.ex });
-          SFX.tone(180, 420, .25, 'triangle', .2);
+          sfx('fortify');
         }
       },
       {
@@ -1118,7 +664,7 @@ const CHAMPS = {
             dir: o.aim, speed: 30, dmg: 7, radius: .45, range: 15, color: 0xcfcfcf, chain: true,
             pull: 1, cc: o.ex ? 'root' : null, ccT: 1
           });
-          SFX.tone(420, 180, .2, 'square', .18);
+          sfx('chain');
         }
       },
       {
@@ -1126,8 +672,8 @@ const CHAMPS = {
         d: 'Definitiva: parte el suelo. 28 de daño, aturde 1,2 s y lanza por los aires a todos los enemigos cercanos.',
         act(f, o) {
           radial(f, { radius: 7.2, dmg: 28, cc: 'stun', ccT: 1.2, kb: 9, color: 0xff7a28 });
-          ringFx(f.pos, 7.2, 0xff7a28);
-          SFX.ult(); shake(1.1);
+          fxRing(f.pos, 7.2, 0xff7a28);
+          sfx('ult'); fxShake(1.1);
         }
       }
     ]
@@ -1138,21 +684,11 @@ const CHAMPS = {
     id: 'lumen', name: 'Lumen', title: 'el Custodio', role: 'Custodio', glyph: '✨',
     color: 0x7fb6ff, hp: 105, speed: 7.0, stats: { atk: 2, def: 3, mob: 3 },
     blurb: 'Mantiene al equipo en pie: cura, escuda y silencia al que se pasa de listo.',
-    build(g) {
-      const robe = MAT(0x3b5a96), trim = MAT(0xdfe7f7), skin = MAT(0xe3c5a6);
-      limb(g, new THREE.ConeGeometry(.52, 1.25, 12), robe, 0, .62, 0);
-      limb(g, new THREE.SphereGeometry(.26, 14, 12), skin, 0, 1.36, 0);
-      limb(g, new THREE.TorusGeometry(.3, .05, 6, 14), trim, 0, 1.14, 0, Math.PI / 2);
-      const orb = new THREE.Mesh(new THREE.SphereGeometry(.22, 14, 12), new THREE.MeshBasicMaterial({ color: 0xbfe0ff }));
-      orb.position.set(.5, 1.25, .34);
-      g.add(orb); g.userData.orb = orb;
-      return g;
-    },
     ab: [
       {
         k: 'M1', n: 'Destello', g: '✨', cd: .6, wind: .08, hold: true,
         d: 'Proyectil de luz: 7 de daño al enemigo, o 9 de curación si alcanza a un aliado.',
-        act(f, o) { shoot(f, { dir: o.aim, speed: 31, dmg: 7, healAlly: 9, radius: .34, range: 24, color: 0xbfe0ff }); SFX.shot(); }
+        act(f, o) { shoot(f, { dir: o.aim, speed: 31, dmg: 7, healAlly: 9, radius: .34, range: 24, color: 0xbfe0ff }); sfx('shot'); }
       },
       {
         k: 'M2', n: 'Aliento sanador', g: '🌿', cd: 5.2, wind: .16, exCost: 50,
@@ -1160,13 +696,13 @@ const CHAMPS = {
         dx: 'Mejorada: cura 27 y libera de efectos de control.',
         act(f, o) {
           coneHeal(f, { dir: o.aim, range: 7.5, arc: 72, heal: o.ex ? 27 : 17, selfHeal: 5, cleanse: o.ex });
-          SFX.heal();
+          sfx('heal');
         }
       },
       {
         k: 'SP', n: 'Planear', g: '🕊️', cd: 7, wind: 0, dashAb: true,
         d: 'Te deslizas 8,6 m y te curas 4.',
-        act(f, o) { startDash(f, { dir: o.move || o.aim, dist: 8.6, dur: .28, invuln: .12 }); healTarget(f, f, 4); SFX.dash(); }
+        act(f, o) { startDash(f, { dir: o.move || o.aim, dist: 8.6, dur: .28, invuln: .12 }); healTarget(f, f, 4); sfx('dash'); }
       },
       {
         k: 'Q', n: 'Santuario', g: '💚', cd: 14, wind: .25, exCost: 50, ground: 13,
@@ -1177,7 +713,7 @@ const CHAMPS = {
             x: o.pt.x, z: o.pt.z, radius: 4.1, dur: o.ex ? 7 : 5.5, tick: 1,
             tickHeal: o.ex ? 6.5 : 4.5, slow: .25, color: 0x7ef0b4, friendly: true
           });
-          SFX.tone(440, 660, .3, 'sine', .2);
+          sfx('sanctuary');
         }
       },
       {
@@ -1187,8 +723,8 @@ const CHAMPS = {
         act(f, o) {
           const t = allyNear(f, o.pt, 13) || f;
           buff(t, { shield: o.ex ? 52 : 32, shieldT: 4.5, haste: o.ex ? .2 : 0, hasteT: 3 });
-          ringFx(t.pos, 1.3, 0xbfe0ff);
-          SFX.tone(300, 700, .22, 'sine', .2);
+          fxRing(t.pos, 1.3, 0xbfe0ff);
+          sfx('aegis');
         }
       },
       {
@@ -1200,7 +736,7 @@ const CHAMPS = {
             dir: o.aim, speed: 34, dmg: 6, radius: .5, range: 18, color: 0xfff3c0,
             cc: o.ex ? 'stun' : 'silence', ccT: o.ex ? .7 : 1.2, cc2: o.ex ? 'silence' : null, cc2T: 1.2
           });
-          SFX.tone(880, 1400, .16, 'sine', .2);
+          sfx('flare');
         }
       },
       {
@@ -1213,8 +749,8 @@ const CHAMPS = {
             healTarget(f, a, 42);
             buff(a, { cleanse: true, haste: .3, hasteT: 3 });
           }
-          ringFx(f.pos, 9, 0xbfe0ff);
-          SFX.ult();
+          fxRing(f.pos, 9, 0xbfe0ff);
+          sfx('ult');
         }
       }
     ]
@@ -1246,8 +782,11 @@ const RELICS = [
 ];
 const RELIC_TAG = { com: 'Reliquia común', rare: 'Reliquia rara', epic: 'Reliquia épica' };
 /* ============================ luchadores ============================ */
+/* Simulación pura: sin three.js, sin DOM, sin audio. Todo lo que habría que
+   dibujar o sonar sale por la cola de eventos de 10_core.js. Este archivo,
+   junto con 10, 20, 40 y 50, es lo que correría un servidor autoritativo tal
+   cual — y lo que `node tests/sim.js` ejecuta sin ningún doble.            */
 let _uid = 0;
-const TEAM_COL = [0x4a9ef0, 0xe8574c];
 const BOT_NAMES = [['Kael', 'Nera', 'Orin', 'Sila'], ['Drax', 'Vora', 'Tarn', 'Mire']];
 
 function makeFighter(champId, team, isBot, name) {
@@ -1266,25 +805,10 @@ function makeFighter(champId, team, isBot, name) {
       startEnergy: 0, ultCost: 0, dashHaste: false, dashShield: 0, lowHpDr: 0, mark: 0, autoShield: 0, echo: 0
     },
     relics: [], stats: { dmg: 0, heal: 0, taken: 0, kills: 0, rounds: 0 },
-    ai: null, mesh: null, plate: null, hitFlash: 0, bob: 0, anim: 0
+    ai: null,
+    // estado de animación: números planos que la vista lee y el servidor ignora
+    hitFlash: 0, bob: 0, anim: 0
   };
-  const g = new THREE.Group();
-  const ringGeo = new THREE.RingGeometry(.58, .8, 26);
-  ringGeo.rotateX(-Math.PI / 2);
-  const ring = new THREE.Mesh(ringGeo, new THREE.MeshBasicMaterial({ color: TEAM_COL[team], transparent: true, opacity: .8, side: THREE.DoubleSide, depthWrite: false }));
-  ring.position.y = .04;
-  g.add(ring);
-  const body = new THREE.Group();
-  C.build(body);
-  g.add(body);
-  const nose = new THREE.Mesh(new THREE.ConeGeometry(.15, .38, 6), new THREE.MeshBasicMaterial({ color: TEAM_COL[team] }));
-  nose.rotation.x = Math.PI / 2; nose.position.set(0, .92, .58);
-  g.add(nose);
-  // tinte de equipo en el material principal
-  body.traverse(o => { if (o.isMesh) { o.material = o.material.clone(); o.castShadow = true; } });
-  g.userData = { body, ring, base: body.scale.x || 1 };
-  f.mesh = g;
-  scene.add(g);
   G.byId.set(f.uid, f);
   return f;
 }
@@ -1308,10 +832,6 @@ function resetFighter(f, x, z, faceDir) {
   f.px = x; f.pz = z; f.pface = faceDir;
   f.velEst.x = 0; f.velEst.z = 0;
   f.face = faceDir; f.aimDir.x = Math.sin(faceDir); f.aimDir.z = Math.cos(faceDir);
-  f.mesh.visible = true;
-  f.mesh.position.set(x, 0, z);
-  f.mesh.rotation.set(0, faceDir, 0);
-  f.mesh.scale.setScalar(1);
   if (f.mods.autoShield) f.st.autoT = f.mods.autoShield;
   if (f.ai) {                       // que los bots no reaccionen todos en el mismo fotograma
     f.ai.hold = rnd(.1, .8); f.ai.think = rnd(0, .3); f.ai.tgtId = 0;
@@ -1354,8 +874,7 @@ function dealDamage(src, tgt, amount, opts) {
     }
   }
   gainEnergy(tgt, dmg * .16);
-  floatNum(tgt.pos, Math.round(dmg), dmg >= 18 ? 'crit' : 'dmg');
-  if (tgt === G.player || src === G.player) SFX.hit();
+  emit({ e: 'dmg', id: tgt.uid, byId: src ? src.uid : 0, dmg, x: tgt.pos.x, z: tgt.pos.z });
   if (tgt.hp <= 0) killFighter(tgt, src);
   return dmg;
 }
@@ -1369,7 +888,7 @@ function healTarget(src, tgt, amount, silent) {
     if (src !== tgt) src.stats.heal += h;
     gainEnergy(src, h * .3);
   }
-  if (!silent) floatNum(tgt.pos, '+' + h, 'heal');
+  if (!silent) emit({ e: 'heal', id: tgt.uid, amount: h, x: tgt.pos.x, z: tgt.pos.z });
   return h;
 }
 
@@ -1388,12 +907,10 @@ function applyCC(f, type, t) {
     e.n++; e.t = 6.5;
   }
   t *= 1 - f.mods.tenacity;
-  if (t <= .08) { floatNum(f.pos, 'Inmune', 'en'); return; }
+  if (t <= .08) { emit({ e: 'cc', id: f.uid, type: 'immune', x: f.pos.x, z: f.pos.z }); return; }
   f.st[type] = Math.max(f.st[type] || 0, t);
   if (type === 'stun' && f.casting) cancelCast(f);
-  if (type === 'stun') floatNum(f.pos, 'Aturdido', 'en');
-  else if (type === 'root') floatNum(f.pos, 'Raíz', 'en');
-  else if (type === 'silence') floatNum(f.pos, 'Silencio', 'en');
+  emit({ e: 'cc', id: f.uid, type, x: f.pos.x, z: f.pos.z });
 }
 
 function applySlow(f, amt, t) {
@@ -1416,42 +933,33 @@ function killFighter(f, src) {
   if (!f.alive) return;
   f.alive = false; f.hp = 0; f.shield = 0; f.deadT = 0;
   f.dash = null; f.casting = null;
-  puff(f.pos, TEAM_COL[f.team], 26);
-  SFX.die();
   if (src && src !== f) src.stats.kills++;
   const who = src && src !== f ? src : null;
-  if (!G.firstBlood && who) { G.firstBlood = true; feed(`<b class="${who.team ? 'b' : 'a'}">${who.name}</b> abre el marcador`); }
-  feed(who ? `<b class="${who.team ? 'b' : 'a'}">${who.name}</b> elimina a <b class="${f.team ? 'b' : 'a'}">${f.name}</b>`
-    : `<b class="${f.team ? 'b' : 'a'}">${f.name}</b> cae al vacío`);
-  if (f === G.player) shake(.7);
+  const first = !G.firstBlood && !!who;
+  if (first) G.firstBlood = true;
+  emit({ e: 'kill', id: f.uid, byId: who ? who.uid : 0, first });
 }
 
 /* ============================ primitivas de habilidad ============================ */
 function shoot(f, o) {
   const d = o.dir, len = Math.hypot(d.x, d.z) || 1;
-  const col = o.color || 0xffffff;
-  const scale = o.scale || 1;
-  const geo = o.flat ? new THREE.BoxGeometry(o.radius * 2.2, .3, .7) : new THREE.SphereGeometry(Math.max(.18, o.radius * .8), 10, 8);
-  const mesh = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ color: col }));
-  if (!o.flat) mesh.scale.set(1, 1, scale * 1.7);
-  mesh.position.set(f.pos.x + d.x / len * .7, 1.0, f.pos.z + d.z / len * .7);
-  mesh.rotation.y = Math.atan2(d.x, d.z);
-  scene.add(mesh);
-  const light = null;
+  const x = f.pos.x + d.x / len * .7, z = f.pos.z + d.z / len * .7;
   G.projectiles.push({
-    x: mesh.position.x, z: mesh.position.z, px: mesh.position.x, pz: mesh.position.z,
+    id: ++_uid, x, z, px: x, pz: z,
     dx: d.x / len, dz: d.z / len,
     speed: o.speed, radius: o.radius, range: o.range, traveled: 0,
     dmg: o.dmg || 0, healAlly: o.healAlly || 0, kb: o.kb || 0, pull: o.pull || 0,
     cc: o.cc, ccT: o.ccT || 0, cc2: o.cc2, cc2T: o.cc2T || 0,
-    pierce: !!o.pierce, chain: !!o.chain, team: f.team, ownerId: f.uid, hit: [], mesh, light, alive: true, col
+    pierce: !!o.pierce, chain: !!o.chain, team: f.team, ownerId: f.uid, hit: [], alive: true,
+    // aspecto: lo lee la vista para construir la malla, no afecta a la física
+    col: o.color || 0xffffff, scale: o.scale || 1, flat: !!o.flat
   });
 }
 
 function meleeArc(f, o) {
   const a0 = Math.atan2(o.dir.x, o.dir.z);
   const half = (o.arc || 90) * Math.PI / 360;
-  arcFx(f.pos, a0, half, o.range, o.color || 0xffffff);
+  fxArc(f.pos, a0, half, o.range, o.color || 0xffffff);
   let hit = 0;
   for (const t of G.fighters) {
     if (t.team === f.team || !t.alive) continue;
@@ -1470,7 +978,7 @@ function meleeArc(f, o) {
 function coneHeal(f, o) {
   const a0 = Math.atan2(o.dir.x, o.dir.z);
   const half = (o.arc || 70) * Math.PI / 360;
-  arcFx(f.pos, a0, half, o.range, 0x8ff0bb);
+  fxArc(f.pos, a0, half, o.range, 0x8ff0bb);
   if (o.selfHeal) healTarget(f, f, o.selfHeal);
   if (o.cleanse) cleanse(f);
   for (const t of G.fighters) {
@@ -1508,22 +1016,12 @@ function startDash(f, o) {
 }
 
 function spawnZone(f, o) {
-  const col = o.color || 0xffffff;
-  const geo = new THREE.CircleGeometry(o.radius, 40);
-  geo.rotateX(-Math.PI / 2);
-  const mesh = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ color: col, transparent: true, opacity: .16, depthWrite: false }));
-  mesh.position.set(o.x, .06, o.z);
-  scene.add(mesh);
-  const rg = new THREE.RingGeometry(o.radius * .96, o.radius, 44);
-  rg.rotateX(-Math.PI / 2);
-  const ring = new THREE.Mesh(rg, new THREE.MeshBasicMaterial({ color: col, transparent: true, opacity: .6, depthWrite: false }));
-  ring.position.copy(mesh.position);
-  scene.add(ring);
   G.zones.push({
-    x: o.x, z: o.z, radius: o.radius, dur: o.dur, t: 0, delay: o.delay || 0,
+    id: ++_uid, x: o.x, z: o.z, radius: o.radius, dur: o.dur, t: 0, delay: o.delay || 0,
     tick: o.tick || 0, tickT: 0, tickDmg: o.tickDmg || 0, tickHeal: o.tickHeal || 0,
     dmg: o.dmg || 0, cc: o.cc, ccT: o.ccT || 0, slow: o.slow || 0, trap: !!o.trap,
-    friendly: !!o.friendly, rain: !!o.rain, team: f.team, ownerId: f.uid, mesh, ring, alive: true, col
+    friendly: !!o.friendly, rain: !!o.rain, team: f.team, ownerId: f.uid, alive: true,
+    col: o.color || 0xffffff
   });
 }
 
@@ -1648,21 +1146,13 @@ function tickFighter(f, dt) {
   for (let i = 0; i < f.cds.length; i++) if (f.cds[i] > 0) f.cds[i] = Math.max(0, f.cds[i] - dt);
   if (f.mods.autoShield) {
     st.autoT -= dt;
-    if (st.autoT <= 0) { st.autoT = f.mods.autoShield; addShield(f, 26, 6); ringFx(f.pos, 1.1, 0xbfe0ff); }
+    if (st.autoT <= 0) { st.autoT = f.mods.autoShield; addShield(f, 26, 6); fxRing(f.pos, 1.1, 0xbfe0ff); }
   }
 
-  if (!f.alive) {
-    f.deadT += dt;
-    f.mesh.rotation.x = Math.min(Math.PI / 2, f.deadT * 4);
-    f.mesh.position.y = Math.max(-1.2, -f.deadT * .6);
-    if (f.deadT > 1.4) f.mesh.visible = false;
-    return;
-  }
+  if (!f.alive) { f.deadT += dt; return; }     // la vista deriva la caída de deadT
   if (f.falling > 0) {
     f.falling += dt;
-    f.mesh.position.y -= dt * 14;
-    f.mesh.rotation.z += dt * 3;
-    if (f.falling > .55) { killFighter(f, fighterById(f.lastHitById)); f.mesh.visible = false; }
+    if (f.falling > .55) killFighter(f, fighterById(f.lastHitById));
     return;
   }
 
@@ -1690,7 +1180,6 @@ function tickFighter(f, dt) {
     f.pos.x += d.dx * step; f.pos.z += d.dz * step;
     if (collidePillars(f.pos, .5)) d.t = d.dur;
     pushInside(f.pos, .5);
-    if (d.trail && frand() < .5) puff(f.pos, d.trail, 2, .5);   // estela: presentación
     if (d.dmg || d.cc) {
       for (const t of G.fighters) {
         if (t.team === f.team || !t.alive || d.hit.indexOf(t.uid) >= 0) continue;
@@ -1738,34 +1227,6 @@ function tickFighter(f, dt) {
   }
 }
 
-/* La simulación avanza a saltos fijos de 1/60 s; `alpha` dice qué fracción del
-   siguiente paso lleva acumulada el fotograma actual. Interpolar entre la
-   posición anterior y la nueva es lo que mantiene el movimiento suave también
-   a 120 o 144 Hz, donde un paso fijo sin interpolar se vería a tirones. */
-function updateFighterVisual(f, alpha) {
-  if (!f.alive || f.falling) return;
-  const m = f.mesh;
-  m.position.x = lerp(f.px, f.pos.x, alpha);
-  m.position.z = lerp(f.pz, f.pos.z, alpha);
-  m.position.y = Math.abs(Math.sin(f.bob)) * .06 + (f.anim > 0 ? .1 : 0);
-  m.rotation.y = f.pface + angDiff(f.face, f.pface) * alpha;
-  const b = m.userData.body;
-  const base = m.userData.base;
-  const pulse = f.anim > 0 ? 1 + f.anim * .5 : 1;
-  b.scale.setScalar(base * pulse);
-  b.rotation.z = Math.sin(f.bob) * .05;
-  // parpadeo al recibir daño / estado
-  const flash = f.hitFlash > 0;
-  b.traverse(o => {
-    if (!o.isMesh || !o.material.emissive) return;
-    if (flash) o.material.emissive.setHex(0x883322);
-    else if (f.st.stun > 0) o.material.emissive.setHex(0x554400);
-    else if (f.shield > 0) o.material.emissive.setHex(0x223355);
-    else o.material.emissive.setHex(0x000000);
-  });
-  m.userData.ring.material.opacity = f.st.invuln > 0 ? .3 : .8;
-}
-
 /* ============================ proyectiles ============================ */
 function updateProjectiles(dt) {
   for (let i = G.projectiles.length - 1; i >= 0; i--) {
@@ -1788,7 +1249,7 @@ function updateProjectiles(dt) {
       if (friendly) {
         healTarget(owner, t, p.healAlly);
       } else {
-        if (t.st.evade > 0) { t.st.evade = 0; floatNum(t.pos, 'Evadido', 'en'); continue; }
+        if (t.st.evade > 0) { t.st.evade = 0; emit({ e: 'evade', id: t.uid, x: t.pos.x, z: t.pos.z }); continue; }
         dealDamage(owner, t, p.dmg);
         t.lastHitById = p.ownerId;
         if (p.cc) applyCC(t, p.cc, p.ccT);
@@ -1798,19 +1259,14 @@ function updateProjectiles(dt) {
           applyKnockback(t, dx, dz, Math.max(0, Math.hypot(dx, dz) - 2) * 4.2);
         } else if (p.kb) applyKnockback(t, p.dx, p.dz, p.kb);
       }
-      hitFx(p.x, p.z, p.col);
+      fxHit(p.x, p.z, p.col);
       if (!p.pierce) { consumed = true; break; }
     }
     if (consumed) destroyProj(p, i, true);
   }
 }
-function updateProjectileVisual(alpha) {
-  for (const p of G.projectiles) p.mesh.position.set(lerp(p.px, p.x, alpha), 1.0, lerp(p.pz, p.z, alpha));
-}
 function destroyProj(p, i, fx) {
-  if (fx) hitFx(p.x, p.z, p.col);
-  scene.remove(p.mesh);
-  p.mesh.geometry.dispose(); p.mesh.material.dispose();
+  if (fx) fxHit(p.x, p.z, p.col);
   G.projectiles.splice(i, 1);
 }
 
@@ -1818,18 +1274,8 @@ function destroyProj(p, i, fx) {
 function updateZones(dt) {
   for (let i = G.zones.length - 1; i >= 0; i--) {
     const z = G.zones[i];
-    if (z.delay > 0) {
-      z.delay -= dt;
-      z.mesh.material.opacity = .05 + Math.abs(Math.sin(G.t * 9)) * .12;
-      continue;
-    }
+    if (z.delay > 0) { z.delay -= dt; continue; }
     z.t += dt;
-    z.ring.rotation.y += dt * .6;
-    z.mesh.material.opacity = .13 + Math.sin(G.t * 3) * .03;
-    if (z.rain && frand() < dt * 40) {                // solo lluvia visible
-      const a = frand() * TAU, r = Math.sqrt(frand()) * z.radius;
-      rainFx(z.x + Math.cos(a) * r, z.z + Math.sin(a) * r, z.col);
-    }
     const owner = fighterById(z.ownerId);
     if (z.trap) {
       for (const t of G.fighters) {
@@ -1837,7 +1283,7 @@ function updateZones(dt) {
         if (dist(t.pos.x, t.pos.z, z.x, z.z) > z.radius) continue;
         dealDamage(owner, t, z.dmg);
         applyCC(t, z.cc, z.ccT);
-        ringFx({ x: z.x, y: 0, z: z.z }, z.radius, z.col);
+        fxRing({ x: z.x, z: z.z }, z.radius, z.col);
         z.t = z.dur + 1;
         break;
       }
@@ -1862,133 +1308,39 @@ function updateZones(dt) {
         }
       }
     }
-    if (z.t >= z.dur) {
-      scene.remove(z.mesh); scene.remove(z.ring);
-      z.mesh.geometry.dispose(); z.mesh.material.dispose();
-      z.ring.geometry.dispose(); z.ring.material.dispose();
-      G.zones.splice(i, 1);
-    }
+    if (z.t >= z.dur) G.zones.splice(i, 1);
   }
 }
 
 /* ============================ orbes ============================ */
 function spawnPickup(type, x, z) {
-  const c = type === 'energy' ? 0xffcf5a : 0x5fd39a;
-  const m = new THREE.Mesh(new THREE.OctahedronGeometry(.5, 0), new THREE.MeshStandardMaterial({ color: c, emissive: c, emissiveIntensity: .7, roughness: .3 }));
-  m.position.set(x, 1.1, z);
-  m.castShadow = true;
-  scene.add(m);
-  const halo = new THREE.Mesh(new THREE.RingGeometry(.7, .95, 24).rotateX(-Math.PI / 2), new THREE.MeshBasicMaterial({ color: c, transparent: true, opacity: .5, depthWrite: false }));
-  halo.position.set(x, .08, z);
-  scene.add(halo);
-  G.pickups.push({ type, x, z, mesh: m, halo, t: 0 });
+  G.pickups.push({ id: ++_uid, type, x, z, t: 0 });
 }
 function updatePickups(dt) {
   for (let i = G.pickups.length - 1; i >= 0; i--) {
     const p = G.pickups[i];
     p.t += dt;
-    p.mesh.rotation.y += dt * 1.8;
-    p.mesh.position.y = 1.1 + Math.sin(p.t * 2.4) * .18;
-    p.halo.scale.setScalar(1 + Math.sin(p.t * 2.4) * .08);
     for (const f of G.fighters) {
       if (!f.alive || dist(f.pos.x, f.pos.z, p.x, p.z) > 1.25) continue;
       if (p.type === 'energy') {
         gainEnergy(f, 38);
         for (const a of G.fighters) if (a.team === f.team && a !== f && a.alive) gainEnergy(a, 16);
-        floatNum(f.pos, '+38 energía', 'en');
       } else {
         healTarget(null, f, 30);
       }
-      SFX.orb();
-      scene.remove(p.mesh); scene.remove(p.halo);
+      emit({ e: 'orb', id: p.id, kind: p.type, byId: f.uid, x: p.x, z: p.z });
       G.pickups.splice(i, 1);
       break;
     }
   }
 }
-function clearPickups() {
-  for (const p of G.pickups) { scene.remove(p.mesh); scene.remove(p.halo); }
-  G.pickups.length = 0;
-}
+function clearPickups() { G.pickups.length = 0; }
 
-/* ============================ efectos ============================ */
-function puff(pos, col, n, scale) {
-  for (let i = 0; i < n; i++) {
-    const m = new THREE.Mesh(new THREE.SphereGeometry((scale || 1) * frnd(.08, .2), 6, 5), new THREE.MeshBasicMaterial({ color: col, transparent: true, opacity: .9 }));
-    m.position.set(pos.x + frnd(-.4, .4), (pos.y || 0) + frnd(.3, 1.5), pos.z + frnd(-.4, .4));
-    scene.add(m);
-    G.fx.push({ mesh: m, t: 0, dur: frnd(.3, .7), vy: frnd(1, 4), vx: frnd(-2.5, 2.5), vz: frnd(-2.5, 2.5), kind: 'puff' });
-  }
-}
-function hitFx(x, z, col) {
-  const m = new THREE.Mesh(new THREE.SphereGeometry(.34, 8, 6), new THREE.MeshBasicMaterial({ color: col, transparent: true, opacity: .9 }));
-  m.position.set(x, 1.0, z);
-  scene.add(m);
-  G.fx.push({ mesh: m, t: 0, dur: .2, kind: 'pop' });
-}
-function ringFx(pos, radius, col) {
-  const g = new THREE.RingGeometry(radius * .82, radius, 48);
-  g.rotateX(-Math.PI / 2);
-  const m = new THREE.Mesh(g, new THREE.MeshBasicMaterial({ color: col, transparent: true, opacity: .85, depthWrite: false, side: THREE.DoubleSide }));
-  m.position.set(pos.x, .12, pos.z);
-  m.scale.setScalar(.25);
-  scene.add(m);
-  G.fx.push({ mesh: m, t: 0, dur: .45, kind: 'ring' });
-}
-function arcFx(pos, a0, half, range, col) {
-  const shape = new THREE.Shape();
-  shape.moveTo(0, 0);
-  shape.absarc(0, 0, range, -half + Math.PI / 2, half + Math.PI / 2, false);
-  shape.lineTo(0, 0);
-  const g = new THREE.ShapeGeometry(shape, 12);
-  g.rotateX(-Math.PI / 2);
-  const m = new THREE.Mesh(g, new THREE.MeshBasicMaterial({ color: col, transparent: true, opacity: .45, side: THREE.DoubleSide, depthWrite: false }));
-  m.position.set(pos.x, .14, pos.z);
-  m.rotation.y = a0 + Math.PI;
-  scene.add(m);
-  G.fx.push({ mesh: m, t: 0, dur: .22, kind: 'fade' });
-}
-function rainFx(x, z, col) {
-  const m = new THREE.Mesh(new THREE.CylinderGeometry(.04, .04, 1.1, 4), new THREE.MeshBasicMaterial({ color: col }));
-  m.position.set(x, 7, z);
-  scene.add(m);
-  G.fx.push({ mesh: m, t: 0, dur: .5, vy: -18, kind: 'fall' });
-}
-function updateFx(dt) {
-  for (let i = G.fx.length - 1; i >= 0; i--) {
-    const e = G.fx[i];
-    e.t += dt;
-    const k = e.t / e.dur;
-    if (e.kind === 'puff') {
-      e.mesh.position.x += e.vx * dt; e.mesh.position.z += e.vz * dt;
-      e.mesh.position.y += (e.vy - k * 6) * dt;
-      e.mesh.material.opacity = .9 * (1 - k);
-    } else if (e.kind === 'pop') {
-      e.mesh.scale.setScalar(1 + k * 2.2);
-      e.mesh.material.opacity = .9 * (1 - k);
-    } else if (e.kind === 'ring') {
-      e.mesh.scale.setScalar(.25 + k * .85);
-      e.mesh.material.opacity = .85 * (1 - k);
-    } else if (e.kind === 'fade') {
-      e.mesh.material.opacity = .45 * (1 - k);
-    } else if (e.kind === 'fall') {
-      e.mesh.position.y += e.vy * dt;
-      if (e.mesh.position.y < .2) e.t = e.dur;
-    }
-    if (e.t >= e.dur) {
-      scene.remove(e.mesh);
-      e.mesh.geometry.dispose(); e.mesh.material.dispose();
-      G.fx.splice(i, 1);
-    }
-  }
-}
 function clearTransient() {
-  for (let i = G.projectiles.length - 1; i >= 0; i--) destroyProj(G.projectiles[i], i, false);
-  for (const z of G.zones) { scene.remove(z.mesh); scene.remove(z.ring); }
+  G.projectiles.length = 0;
   G.zones.length = 0;
-  for (const e of G.fx) scene.remove(e.mesh);
-  G.fx.length = 0;
   clearPickups();
+  emit({ e: 'clearFx' });      // que la vista tire también sus partículas
 }
 /* ============================ bots ============================ */
 const ROLE_RANGE = { 'Tirador': 8.6, 'Vanguardia': 2.5, 'Custodio': 7.4 };
@@ -2228,10 +1580,1013 @@ function botPickRelic(f, options) {
   for (const id of pref) { const o = options.find(x => x.id === id); if (o) return o; }
   return pickOne(options);
 }
+/* ============================ partida ============================ */
+/* La máquina de estados del combate: composición de equipos, rondas, reliquias
+   y condición de victoria. Es exactamente lo que gobernaría un servidor de
+   partida, así que no toca el DOM ni el audio: anuncia por eventos y deja las
+   opciones de reliquia en `G.relicOptions` para que las pinte quien quiera.
+
+   `SEL` es lo que el jugador eligió en el menú. Aquí vive porque es lo que lee
+   startMatch; quien lo escribe es la interfaz.                              */
+const SEL = { mode: 'duo', diff: 'normal', champ: 'vesk' };
+
+function spawnPoints(team, n) {
+  const x = team === 0 ? -14.5 : 14.5;
+  const out = [];
+  for (let i = 0; i < n; i++) out.push({ x, z: (i - (n - 1) / 2) * 3.4, a: team === 0 ? Math.PI / 2 : -Math.PI / 2 });
+  return out;
+}
+
+/* `seed` sirve para repetir una partida entera: con la misma semilla y la
+   misma entrada, el combate se desarrolla igual paso a paso. Si no se pasa, se
+   sortea una y se guarda en G.seed. */
+function startMatch(seed) {
+  quitMatch();
+  G.seed = seed === undefined ? (frand() * 0xFFFFFFFF) >>> 0 : (seed >>> 0);
+  seedSim(G.seed);
+  G.mode = MODES[SEL.mode];
+  G.diff = SEL.diff;
+  G.wins = G.mode.wins;
+  G.round = 1; G.score = [0, 0]; G.picks = 0;
+  G.playerTeam = 0;
+  G.roundLimit = G.mode.time || 9999;
+
+  const n = G.mode.size;
+  // composición: nunca repetir campeón dentro de un equipo si se puede evitar
+  const teamComp = t => {
+    const list = [];
+    const rest = CHAMP_LIST.filter(c => !(t === 0 && c === SEL.champ));
+    if (t === 0) list.push(SEL.champ);
+    const order = t === 0 ? ['brakk', 'lumen', 'vesk'] : ['lumen', 'vesk', 'brakk'];
+    for (const c of order) {
+      if (list.length >= n) break;
+      if (list.includes(c)) continue;
+      if (t === 0 && !rest.includes(c)) continue;
+      list.push(c);
+    }
+    while (list.length < n) list.push(pickOne(CHAMP_LIST));
+    return list.slice(0, n);
+  };
+  for (let t = 0; t < 2; t++) {
+    const comp = teamComp(t);
+    comp.forEach((cid, i) => {
+      const isBot = !(t === 0 && i === 0);
+      const f = makeFighter(cid, t, isBot, isBot ? BOT_NAMES[t][i % 4] : 'Tú');
+      if (isBot) makeAI(f, G.diff);
+      else G.player = f;
+      G.fighters.push(f);
+    });
+  }
+  G.started = true;
+  emit({ e: 'matchStart' });         // la vista monta HUD, placas y marcos
+  if (G.mode.id === 'training') { beginRound(); emit({ e: 'training' }); }
+  else openRelicPick();
+}
+
+function quitMatch() {
+  G.fighters.length = 0;
+  G.byId.clear();
+  _uid = 0;                 // los ids arrancan de cero en cada partida, como en un servidor
+  G.player = null; G.started = false; G.sudden = false; G.shrink = 1;
+  G.relicOptions = null;
+  clearTransient();
+  G.paused = false;
+  emit({ e: 'matchEnd' });
+}
+
+function beginRound() {
+  const n = G.mode.size;
+  for (const t of [0, 1]) {
+    const pts = spawnPoints(t, n);
+    let i = 0;
+    for (const f of G.fighters) if (f.team === t) { const p = pts[i++]; resetFighter(f, p.x, p.z, p.a); }
+  }
+  clearTransient();
+  G.roundTime = 0; G.sudden = false; G.shrink = 1;
+  G.firstBlood = false;
+  G.relicOptions = null;
+  G.nextOrb = 18; G.nextHeal = 26;
+  G.state = 'intro';
+  G.introT = 3.2;
+  emit({ e: 'roundStart', round: G.round, score: G.score.slice(), training: G.mode.id === 'training' });
+}
+
+function endRound(winner) {
+  if (G.state !== 'live') return;
+  G.state = 'roundend';
+  G.roundEndT = 3.4;
+  if (winner >= 0) {
+    G.score[winner]++;
+    for (const f of G.fighters) if (f.team === winner) f.stats.rounds++;
+  }
+  emit({ e: 'roundEnd', winner, score: G.score.slice() });
+  G.timeScale = .35;
+}
+
+/* Las tres opciones se sortean aquí, con el generador con semilla, y se dejan
+   en G.relicOptions. La interfaz las pinta; cuando el jugador elige, llama a
+   pickRelic. En red, el servidor haría exactamente esto y esperaría la
+   respuesta con un plazo. */
+function openRelicPick() {
+  G.picks++;
+  G.state = 'brite';
+  const taken = new Set(G.player.relics.map(r => r.id));
+  const pool = RELICS.filter(r => !taken.has(r.id));
+  const opts = [];
+  const byRar = r => pool.filter(x => x.r === r && !opts.includes(x));
+  const wantEpic = G.picks >= 3 ? 1 : 0;
+  while (opts.length < 3) {
+    let cand;
+    if (opts.length === 0) cand = pickOne(byRar('com'));
+    else if (opts.length === 1) cand = pickOne(byRar(chance(.6) ? 'rare' : 'com'));
+    else cand = pickOne(byRar(wantEpic && chance(.55) ? 'epic' : 'rare'));
+    if (!cand) cand = pickOne(pool.filter(x => !opts.includes(x)));
+    if (!cand) break;
+    opts.push(cand);
+  }
+  G.relicOptions = opts;
+  emit({ e: 'relics', picks: G.picks, of: G.wins + 2 });
+}
+
+/* Elige la reliquia `i` de las ofrecidas, deja que los bots elijan la suya y
+   arranca la ronda. */
+function pickRelic(i) {
+  if (G.state !== 'brite' || !G.relicOptions) return false;
+  const r = G.relicOptions[i];
+  if (!r) return false;
+  applyRelic(G.player, r);
+  for (const f of G.fighters) {
+    if (f === G.player || !f.isBot) continue;
+    const own = new Set(f.relics.map(x => x.id));
+    const p = RELICS.filter(x => !own.has(x.id));
+    const three = [pickOne(p), pickOne(p), pickOne(p)].filter(Boolean);
+    const chosen = botPickRelic(f, three.length ? three : [pickOne(RELICS)]);
+    if (chosen) applyRelic(f, chosen);
+  }
+  G.relicOptions = null;
+  beginRound();
+  return true;
+}
+
+function endMatch(winner) {
+  G.state = 'result';
+  emit({ e: 'matchResult', winner, score: G.score.slice() });
+}
+
+function togglePause() {
+  if (!G.started) return;
+  if (G.state === 'brite' || G.state === 'result') return;
+  G.paused = !G.paused;
+  emit({ e: 'pause', on: G.paused });
+}
+
+/* ============================ ritmo de la ronda ============================ */
+function updateRound(dt) {
+  if (G.state === 'intro') {
+    G.introT -= dt;
+    const n = Math.ceil(G.introT - .2);
+    if (n > 0 && n <= 3 && G.introN !== n) { G.introN = n; emit({ e: 'countdown', n }); }
+    if (G.introT <= .2 && G.introN !== 0) { G.introN = 0; emit({ e: 'countdown', n: 0 }); }
+    if (G.introT <= 0) { G.state = 'live'; G.introN = -1; }
+    return;
+  }
+  if (G.state === 'roundend') {
+    G.roundEndT -= dt;
+    G.timeScale = lerp(G.timeScale, 1, dt * 1.2);
+    if (G.roundEndT <= 0) {
+      G.timeScale = 1;
+      const w = G.score[0] >= G.wins ? 0 : G.score[1] >= G.wins ? 1 : -1;
+      if (w >= 0) endMatch(w);
+      else { G.round++; openRelicPick(); }
+    }
+    return;
+  }
+  if (G.state !== 'live') return;
+
+  G.roundTime += dt;
+
+  // orbes
+  if (G.mode.id !== 'training') {
+    G.nextOrb -= dt;
+    if (G.nextOrb <= 0) { G.nextOrb = 24; spawnPickup('energy', 0, 0); emit({ e: 'orbSpawn', kind: 'energy' }); }
+    G.nextHeal -= dt;
+    if (G.nextHeal <= 0) {
+      G.nextHeal = 30;
+      spawnPickup('health', 0, -9.6);
+      spawnPickup('health', 0, 9.6);
+    }
+  } else {
+    gainEnergy(G.player, dt * 14);
+  }
+
+  // muerte súbita
+  const sdStart = Math.max(30, G.roundLimit - 55);
+  if (G.mode.id !== 'training') {
+    if (!G.sudden && G.roundTime > sdStart) {
+      G.sudden = true;
+      emit({ e: 'sudden' });
+    }
+    if (G.sudden) G.shrink = clamp(1 - (G.roundTime - sdStart) / 42 * .72, .26, 1);
+  }
+
+  // fin de ronda
+  let alive = [0, 0];
+  for (const f of G.fighters) if (f.alive) alive[f.team]++;
+  if (G.mode.id === 'training') {
+    for (const f of G.fighters) {
+      if (f.alive) continue;
+      f.deadT2 = (f.deadT2 || 0) + dt;
+      if (f.deadT2 > 3) {
+        f.deadT2 = 0;
+        const pts = spawnPoints(f.team, G.mode.size);
+        const p = pts[0];
+        resetFighter(f, p.x, p.z, p.a);
+      }
+    }
+    return;
+  }
+  if (alive[0] === 0 || alive[1] === 0) {
+    if (alive[0] === 0 && alive[1] === 0) endRound(-1);
+    else endRound(alive[0] === 0 ? 1 : 0);
+    return;
+  }
+  if (G.roundTime >= G.roundLimit) {
+    const r = [0, 0];
+    for (const f of G.fighters) if (f.alive) r[f.team] += f.hp / f.maxHp;
+    endRound(r[0] === r[1] ? -1 : (r[0] > r[1] ? 0 : 1));
+  }
+}
+
+/* ============================ el paso de simulación ============================ */
+/* Todo lo que cambia el estado de juego ocurre aquí y solo aquí, siempre con el
+   mismo dt. `cmd` es la intención del jugador local: llega como parámetro, no
+   se lee del teclado desde dentro. Esa firma es la frontera del modo online —
+   un servidor llamaría a esto con el comando que le llegó por la red, y un
+   cliente lo llamará de nuevo con los comandos sin confirmar al reconciliar. */
+function simStep(dt, cmd) {
+  G.dt = dt;
+  // la posición del paso anterior sirve para dos cosas: estimar la velocidad
+  // (la usan los bots al predecir) e interpolar la vista entre pasos
+  for (const f of G.fighters) { f.px = f.pos.x; f.pz = f.pos.z; f.pface = f.face; }
+  for (const p of G.projectiles) { p.px = p.x; p.pz = p.z; }
+
+  if (cmd && G.player && G.player.alive) applyInput(G.player, cmd);
+  G.order++;
+  const order = fightersInOrder();
+  if (G.state === 'live') {
+    for (const f of order) if (f.isBot && f.alive) updateAI(f, dt);
+  } else {
+    for (const f of G.fighters) { f.moveDir.x = 0; f.moveDir.z = 0; }
+  }
+  for (const f of order) tickFighter(f, dt);
+  updateProjectiles(dt);
+  updateZones(dt);
+  updatePickups(dt);
+  for (const f of G.fighters) {
+    f.velEst.x = (f.pos.x - f.px) / dt;
+    f.velEst.z = (f.pos.z - f.pz) / dt;
+  }
+  updateRound(dt);
+}
+/* ============================ vista: motor y escena ============================ */
+/* De aquí para abajo empieza la mitad que se puede tirar entera sin que el
+   juego deje de funcionar: nada de este archivo decide nada, solo mira el
+   estado de la simulación y lo convierte en píxeles.
+
+   La escena se mantiene sincronizada por reconciliación, no por mensajes:
+   `syncView()` recorre las listas de entidades, crea la malla de las nuevas y
+   destruye la de las que ya no están. Es más corto que emitir un evento por
+   cada nacimiento y muerte, no se pierde nada si un evento se cae, y es justo
+   lo que tendrá que hacer un cliente al recibir instantáneas por la red.   */
+const $ = id => document.getElementById(id);
+const el = (tag, cls, html) => { const e = document.createElement(tag); if (cls) e.className = cls; if (html != null) e.innerHTML = html; return e; };
+const TEAM_COL = [0x4a9ef0, 0xe8574c];
+
+/* ============================ motor ============================ */
+let renderer, scene, camera, clock, floorMesh, ringMesh, sdRing, embers;
+const CAM = { tilt: 0.985, dist: 46, follow: false, amt: 0, tgt: new THREE.Vector3(), shake: new THREE.Vector3() };
+const tmpV = new THREE.Vector3(), tmpV2 = new THREE.Vector3();
+
+function initEngine() {
+  const canvas = $('gl');
+  renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: 'high-performance' });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+  renderer.shadowMap.enabled = true;
+  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+  if (THREE.sRGBEncoding) renderer.outputEncoding = THREE.sRGBEncoding;
+  scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x05070d);
+  scene.fog = new THREE.Fog(0x05070d, 52, 108);
+  camera = new THREE.PerspectiveCamera(40, 1, 1, 260);
+  clock = new THREE.Clock();
+  buildLights();
+  buildArena();
+  buildEmbers();
+  window.addEventListener('resize', onResize);
+  onResize();
+}
+
+function buildLights() {
+  scene.add(new THREE.HemisphereLight(0x6f84bd, 0x1a1108, 0.55));
+  const sun = new THREE.DirectionalLight(0xffe9c4, 1.05);
+  sun.position.set(16, 34, 14);
+  sun.castShadow = true;
+  sun.shadow.mapSize.set(2048, 2048);
+  const c = sun.shadow.camera;
+  c.left = -26; c.right = 26; c.top = 24; c.bottom = -24; c.near = 4; c.far = 90;
+  sun.shadow.bias = -0.0012;
+  scene.add(sun);
+  const warm = new THREE.PointLight(0xff7a28, 1.5, 44, 2);
+  warm.position.set(-22, 6, 0); scene.add(warm);
+  const cool = new THREE.PointLight(0x4f86ff, 1.2, 44, 2);
+  cool.position.set(22, 6, 0); scene.add(cool);
+}
+
+function roundedRectShape(hx, hz, r) {
+  const s = new THREE.Shape();
+  const x = hx - r, z = hz - r;
+  s.moveTo(-x, -hz);
+  s.lineTo(x, -hz);
+  s.absarc(x, -z, r, -Math.PI / 2, 0, false);
+  s.lineTo(hx, z);
+  s.absarc(x, z, r, 0, Math.PI / 2, false);
+  s.lineTo(-x, hz);
+  s.absarc(-x, z, r, Math.PI / 2, Math.PI, false);
+  s.lineTo(-hx, -z);
+  s.absarc(-x, -z, r, Math.PI, Math.PI * 1.5, false);
+  s.closePath();
+  return s;
+}
+
+function floorTexture() {
+  const S = 1024, cv = document.createElement('canvas');
+  cv.width = cv.height = S;
+  const g = cv.getContext('2d');
+  g.fillStyle = '#2b2f3c'; g.fillRect(0, 0, S, S);
+  // veteado de piedra
+  for (let i = 0; i < 2600; i++) {
+    const x = frand() * S, y = frand() * S, r = frand() * 46 + 6;
+    g.fillStyle = `rgba(${140 + firnd(50)},${138 + firnd(46)},${150 + firnd(50)},${0.018 + frand() * 0.04})`;
+    g.beginPath(); g.arc(x, y, r, 0, TAU); g.fill();
+  }
+  // losas
+  g.strokeStyle = 'rgba(8,10,16,.55)'; g.lineWidth = 3;
+  const cell = S / 16;
+  for (let i = 1; i < 16; i++) {
+    g.beginPath(); g.moveTo(i * cell, 0); g.lineTo(i * cell, S); g.stroke();
+    g.beginPath(); g.moveTo(0, i * cell); g.lineTo(S, i * cell); g.stroke();
+  }
+  // grietas
+  g.strokeStyle = 'rgba(6,8,12,.5)'; g.lineWidth = 2;
+  for (let i = 0; i < 26; i++) {
+    g.beginPath();
+    let x = frand() * S, y = frand() * S;
+    g.moveTo(x, y);
+    for (let k = 0; k < 7; k++) { x += frnd(-70, 70); y += frnd(-70, 70); g.lineTo(x, y); }
+    g.stroke();
+  }
+  // círculos centrales
+  const cx = S / 2;
+  g.strokeStyle = 'rgba(229,167,67,.30)'; g.lineWidth = 5;
+  g.beginPath(); g.arc(cx, cx, 150, 0, TAU); g.stroke();
+  g.lineWidth = 2.5;
+  g.beginPath(); g.arc(cx, cx, 176, 0, TAU); g.stroke();
+  g.strokeStyle = 'rgba(229,167,67,.2)';
+  for (let i = 0; i < 12; i++) {
+    const a = i / 12 * TAU;
+    g.beginPath();
+    g.moveTo(cx + Math.cos(a) * 152, cx + Math.sin(a) * 152);
+    g.lineTo(cx + Math.cos(a) * 174, cx + Math.sin(a) * 174);
+    g.stroke();
+  }
+  // emblema: dos hojas cruzadas estilizadas
+  g.save(); g.translate(cx, cx); g.strokeStyle = 'rgba(229,167,67,.34)'; g.lineWidth = 9; g.lineCap = 'round';
+  for (const a of [Math.PI / 4, -Math.PI / 4]) {
+    g.save(); g.rotate(a);
+    g.beginPath(); g.moveTo(-96, 0); g.lineTo(96, 0); g.stroke();
+    g.beginPath(); g.moveTo(70, -22); g.lineTo(96, 0); g.lineTo(70, 22); g.stroke();
+    g.restore();
+  }
+  g.restore();
+  // zonas de aparición
+  const paint = (px, col) => {
+    const grd = g.createRadialGradient(px, cx, 10, px, cx, 130);
+    grd.addColorStop(0, col); grd.addColorStop(1, 'rgba(0,0,0,0)');
+    g.fillStyle = grd; g.beginPath(); g.arc(px, cx, 130, 0, TAU); g.fill();
+  };
+  paint(96, 'rgba(74,158,240,.26)');
+  paint(S - 96, 'rgba(232,87,76,.26)');
+  const tex = new THREE.CanvasTexture(cv);
+  if (THREE.sRGBEncoding) tex.encoding = THREE.sRGBEncoding;
+  tex.anisotropy = renderer.capabilities.getMaxAnisotropy ? renderer.capabilities.getMaxAnisotropy() : 4;
+  return tex;
+}
+
+function buildArena() {
+  const shape = roundedRectShape(ARENA.hx, ARENA.hz, ARENA.r);
+  const geo = new THREE.ExtrudeGeometry(shape, { depth: 3.2, bevelEnabled: true, bevelThickness: .28, bevelSize: .34, bevelSegments: 2, curveSegments: 20 });
+  geo.rotateX(-Math.PI / 2);
+  geo.computeBoundingBox();
+  const bb = geo.boundingBox;
+  geo.translate(0, -bb.max.y, 0);          // la cara superior queda a ras de y = 0
+  const uv = geo.attributes.uv, pos = geo.attributes.position;
+  for (let i = 0; i < uv.count; i++) {
+    uv.setXY(i, (pos.getX(i) - bb.min.x) / (bb.max.x - bb.min.x), (pos.getZ(i) - bb.min.z) / (bb.max.z - bb.min.z));
+  }
+  const mat = new THREE.MeshStandardMaterial({ map: floorTexture(), roughness: .92, metalness: .06 });
+  floorMesh = new THREE.Mesh(geo, mat);
+  floorMesh.position.y = -0.03;
+  floorMesh.receiveShadow = true;
+  scene.add(floorMesh);
+
+  // borde luminoso
+  const pts = shape.getPoints(140).map(p => new THREE.Vector3(p.x, 0.07, -p.y));
+  pts.push(pts[0].clone());
+  const lg = new THREE.BufferGeometry().setFromPoints(pts);
+  ringMesh = new THREE.Line(lg, new THREE.LineBasicMaterial({ color: 0xe5a743, transparent: true, opacity: .85 }));
+  scene.add(ringMesh);
+  const lg2 = lg.clone(); lg2.translate(0, -0.55, 0);
+  scene.add(new THREE.Line(lg2, new THREE.LineBasicMaterial({ color: 0xff7a28, transparent: true, opacity: .32 })));
+
+  // anillo de muerte súbita: mismo contorno, escalado
+  const sdPts = shape.getPoints(120).map(p => new THREE.Vector3(p.x, 0, -p.y));
+  sdPts.push(sdPts[0].clone());
+  sdRing = new THREE.Line(new THREE.BufferGeometry().setFromPoints(sdPts),
+    new THREE.LineBasicMaterial({ color: 0xff5530, transparent: true, opacity: .9 }));
+  sdRing.position.y = 0.14; sdRing.visible = false;
+  scene.add(sdRing);
+
+  // pilares
+  ARENA.pillars = [{ x: -8.6, z: -4.9, r: 1.45 }, { x: 8.6, z: -4.9, r: 1.45 }, { x: -8.6, z: 4.9, r: 1.45 }, { x: 8.6, z: 4.9, r: 1.45 }];
+  const pgeo = new THREE.CylinderGeometry(1.2, 1.5, 4.6, 12, 1);
+  const pmat = new THREE.MeshStandardMaterial({ color: 0x39405a, roughness: .8, metalness: .18 });
+  const rgeo = new THREE.TorusGeometry(1.34, .07, 6, 18);
+  const rmat = new THREE.MeshBasicMaterial({ color: 0xe5a743, transparent: true, opacity: .6 });
+  for (const p of ARENA.pillars) {
+    const m = new THREE.Mesh(pgeo, pmat);
+    m.position.set(p.x, 2.3, p.z); m.castShadow = true; m.receiveShadow = true; scene.add(m);
+    for (const y of [1.2, 3.4]) {
+      const r = new THREE.Mesh(rgeo, rmat);
+      r.rotation.x = Math.PI / 2; r.position.set(p.x, y, p.z); scene.add(r);
+    }
+  }
+  // rocas flotantes de ambiente
+  const rock = new THREE.MeshStandardMaterial({ color: 0x1b2030, roughness: 1 });
+  for (let i = 0; i < 14; i++) {
+    const s = frnd(1.2, 4.2);
+    const m = new THREE.Mesh(new THREE.DodecahedronGeometry(s, 0), rock);
+    const a = frand() * TAU, d = frnd(26, 48);
+    m.position.set(Math.cos(a) * d, frnd(-14, -3), Math.sin(a) * d * .8);
+    m.rotation.set(frand() * 3, frand() * 3, frand() * 3);
+    scene.add(m);
+  }
+}
+
+function buildEmbers() {
+  const N = 320, pos = new Float32Array(N * 3), spd = new Float32Array(N);
+  for (let i = 0; i < N; i++) {
+    pos[i * 3] = frnd(-26, 26); pos[i * 3 + 1] = frnd(-6, 20); pos[i * 3 + 2] = frnd(-20, 20);
+    spd[i] = frnd(.5, 2.1);
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  embers = new THREE.Points(g, new THREE.PointsMaterial({ color: 0xff9a45, size: .17, transparent: true, opacity: .55, blending: THREE.AdditiveBlending, depthWrite: false }));
+  embers.userData.spd = spd;
+  scene.add(embers);
+}
+
+function updateEmbers(dt) {
+  const p = embers.geometry.attributes.position, spd = embers.userData.spd;
+  for (let i = 0; i < spd.length; i++) {
+    let y = p.getY(i) + spd[i] * dt;
+    if (y > 21) { y = -7; p.setX(i, frnd(-26, 26)); p.setZ(i, frnd(-20, 20)); }
+    p.setY(i, y);
+  }
+  p.needsUpdate = true;
+}
+
+/* ============================ cámara ============================ */
+function fitCamera() {
+  const corners = [[-ARENA.hx, -ARENA.hz], [ARENA.hx, -ARENA.hz], [ARENA.hx, ARENA.hz], [-ARENA.hx, ARENA.hz]];
+  let d = 30;
+  const test = new THREE.Vector3();
+  for (let i = 0; i < 60; i++) {
+    camera.position.set(0, d * Math.sin(CAM.tilt), d * Math.cos(CAM.tilt));
+    camera.lookAt(0, 0, 0);
+    camera.updateMatrixWorld(true); camera.updateProjectionMatrix();
+    let ok = true;
+    for (const c of corners) {
+      test.set(c[0], 1.2, c[1]).project(camera);
+      if (Math.abs(test.x) > .96 || Math.abs(test.y) > .93) { ok = false; break; }
+    }
+    if (ok) break;
+    d *= 1.045;
+  }
+  CAM.follow = d > 64;
+  CAM.dist = CAM.follow ? 42 : d;
+}
+
+function onResize() {
+  const w = window.innerWidth, h = window.innerHeight;
+  renderer.setSize(w, h, false);
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
+  fitCamera();
+  document.body.classList.toggle('portrait', h > w);
+}
+
+function updateCamera(dt) {
+  let tx = 0, tz = 0;
+  if (CAM.follow && G.player) {
+    tx = clamp(G.player.pos.x * .62, -9.5, 9.5);
+    tz = clamp(G.player.pos.z * .55, -6, 6);
+  }
+  const k = damp(0.002, dt);
+  CAM.tgt.x = lerp(CAM.tgt.x, tx, k);
+  CAM.tgt.z = lerp(CAM.tgt.z, tz, k);
+  if (CAM.amt > 0) {
+    CAM.amt = Math.max(0, CAM.amt - dt * 2.4);
+    const s = CAM.amt * CAM.amt * 1.5;
+    CAM.shake.set(frnd(-s, s), frnd(-s, s), frnd(-s, s));
+  } else CAM.shake.set(0, 0, 0);
+  camera.position.set(
+    CAM.tgt.x + CAM.shake.x,
+    CAM.dist * Math.sin(CAM.tilt) + CAM.shake.y,
+    CAM.tgt.z + CAM.dist * Math.cos(CAM.tilt) + CAM.shake.z);
+  camera.lookAt(CAM.tgt.x, 0, CAM.tgt.z);
+}
+function shake(a) { CAM.amt = Math.min(1.6, CAM.amt + a); }
+
+
+const MAT = (c, o) => new THREE.MeshStandardMaterial(Object.assign({ color: c, roughness: .68, metalness: .12 }, o || {}));
+
+function limb(g, geo, mat, x, y, z, rx, rz) {
+  const m = new THREE.Mesh(geo, mat);
+  m.position.set(x, y, z);
+  if (rx) m.rotation.x = rx;
+  if (rz) m.rotation.z = rz;
+  m.castShadow = true;
+  g.add(m);
+  return m;
+}
+
+
+/* ---------- mallas de cada campeón ---------- */
+/* Con three.js r128 no existe CapsuleGeometry: todo se monta con cilindros,
+   esferas y conos. Añadir un campeón es añadir una entrada aquí y otra en
+   CHAMPS de 20_champs.js. */
+const CHAMP_MESH = {
+  vesk(g) {
+
+      const cloth = MAT(0x2f6d56), skin = MAT(0xdfb894), dark = MAT(0x1d2b28);
+      limb(g, new THREE.CylinderGeometry(.3, .44, 1.0, 10), cloth, 0, .6, 0);
+      limb(g, new THREE.SphereGeometry(.27, 14, 12), skin, 0, 1.32, 0);
+      const hood = limb(g, new THREE.ConeGeometry(.36, .5, 10), cloth, 0, 1.46, -.05);
+      hood.rotation.x = -.12;
+      limb(g, new THREE.BoxGeometry(.1, .62, .1), dark, .42, 1.0, .12, .35, .5);
+      const bow = limb(g, new THREE.TorusGeometry(.42, .05, 5, 12, Math.PI * 1.15), dark, .46, .98, .2);
+      bow.rotation.set(Math.PI / 2, 0, .4);
+      return g;
+  },
+  brakk(g) {
+
+      const iron = MAT(0x7a5236, { metalness: .35, roughness: .6 }), skin = MAT(0xc9a07c), dark = MAT(0x39332c);
+      g.scale.setScalar(1.16);
+      limb(g, new THREE.CylinderGeometry(.42, .5, 1.05, 10), iron, 0, .62, 0);
+      limb(g, new THREE.SphereGeometry(.28, 14, 12), skin, 0, 1.36, 0);
+      limb(g, new THREE.SphereGeometry(.25, 10, 8), iron, .48, 1.08, 0);
+      limb(g, new THREE.SphereGeometry(.25, 10, 8), iron, -.48, 1.08, 0);
+      limb(g, new THREE.BoxGeometry(.12, .9, .12), dark, .6, .78, .22, .5);
+      limb(g, new THREE.BoxGeometry(.42, .34, .5), dark, .72, 1.18, .42);
+      return g;
+  },
+  lumen(g) {
+
+      const robe = MAT(0x3b5a96), trim = MAT(0xdfe7f7), skin = MAT(0xe3c5a6);
+      limb(g, new THREE.ConeGeometry(.52, 1.25, 12), robe, 0, .62, 0);
+      limb(g, new THREE.SphereGeometry(.26, 14, 12), skin, 0, 1.36, 0);
+      limb(g, new THREE.TorusGeometry(.3, .05, 6, 14), trim, 0, 1.14, 0, Math.PI / 2);
+      const orb = new THREE.Mesh(new THREE.SphereGeometry(.22, 14, 12), new THREE.MeshBasicMaterial({ color: 0xbfe0ff }));
+      orb.position.set(.5, 1.25, .34);
+      g.add(orb); g.userData.orb = orb;
+      return g;
+  }
+};
+
+/* ============================ estado → escena ============================ */
+/* La escena se mantiene al día por reconciliación, no por mensajes: se recorren
+   las listas de entidades, se crea la malla de las que no la tienen y se
+   destruye la de las que ya no están. Es más corto que emitir un evento por
+   cada nacimiento y cada muerte, no se pierde nada si un evento se cae, y es
+   exactamente lo que tendrá que hacer un cliente al recibir instantáneas.
+
+   Las mallas viven aquí, en mapas indexados por id, nunca colgadas de la
+   entidad: el estado de juego tiene que poder serializarse. */
+const VIEW = { fighter: new Map(), proj: new Map(), zone: new Map(), pickup: new Map() };
+const _live = new Set();
+
+function syncGroup(list, store, idOf, make, kill) {
+  _live.clear();
+  for (const e of list) {
+    const id = idOf(e);
+    _live.add(id);
+    if (!store.has(id)) store.set(id, make(e));
+  }
+  for (const [id, v] of store) {
+    if (_live.has(id)) continue;
+    kill(v);
+    store.delete(id);
+  }
+}
+
+function disposeMesh(m) {
+  scene.remove(m);
+  if (m.geometry) m.geometry.dispose();
+  if (m.material && m.material.dispose) m.material.dispose();
+}
+
+/* ---------- luchador ---------- */
+function makeFighterMesh(f) {
+  const g = new THREE.Group();
+  const ringGeo = new THREE.RingGeometry(.58, .8, 26);
+  ringGeo.rotateX(-Math.PI / 2);
+  const ring = new THREE.Mesh(ringGeo, new THREE.MeshBasicMaterial({ color: TEAM_COL[f.team], transparent: true, opacity: .8, side: THREE.DoubleSide, depthWrite: false }));
+  ring.position.y = .04;
+  g.add(ring);
+  const body = new THREE.Group();
+  (CHAMP_MESH[f.champ.id] || CHAMP_MESH.vesk)(body);
+  g.add(body);
+  const nose = new THREE.Mesh(new THREE.ConeGeometry(.15, .38, 6), new THREE.MeshBasicMaterial({ color: TEAM_COL[f.team] }));
+  nose.rotation.x = Math.PI / 2; nose.position.set(0, .92, .58);
+  g.add(nose);
+  // tinte de equipo en el material principal
+  body.traverse(o => { if (o.isMesh) { o.material = o.material.clone(); o.castShadow = true; } });
+  g.userData = { body, ring, base: body.scale.x || 1 };
+  g.position.set(f.pos.x, 0, f.pos.z);
+  g.rotation.set(0, f.face, 0);
+  scene.add(g);
+  return g;
+}
+
+/* `alpha` dice qué fracción del siguiente paso lleva acumulada el fotograma.
+   Interpolar entre la posición anterior y la nueva es lo que mantiene el
+   movimiento suave también a 120 o 144 Hz, donde un paso fijo sin interpolar
+   se vería a tirones. Todo lo demás se deriva del estado: la simulación ya no
+   escribe en las mallas. */
+function updateFighterVisual(f, alpha) {
+  const m = VIEW.fighter.get(f.uid);
+  if (!m) return;
+  if (f.falling) {                       // cayendo al vacío, derivado del temporizador
+    m.visible = true;
+    m.position.set(f.pos.x, -f.falling * 14, f.pos.z);
+    m.rotation.z = f.falling * 3;
+    return;
+  }
+  if (!f.alive) {                        // derrumbe, derivado de deadT
+    m.visible = f.deadT <= 1.4;
+    m.rotation.x = Math.min(Math.PI / 2, f.deadT * 4);
+    m.position.y = Math.max(-1.2, -f.deadT * .6);
+    return;
+  }
+  m.visible = true;
+  m.rotation.x = 0; m.rotation.z = 0;
+  m.position.x = lerp(f.px, f.pos.x, alpha);
+  m.position.z = lerp(f.pz, f.pos.z, alpha);
+  m.position.y = Math.abs(Math.sin(f.bob)) * .06 + (f.anim > 0 ? .1 : 0);
+  m.rotation.y = f.pface + angDiff(f.face, f.pface) * alpha;
+  const b = m.userData.body;
+  const pulse = f.anim > 0 ? 1 + f.anim * .5 : 1;
+  b.scale.setScalar(m.userData.base * pulse);
+  b.rotation.z = Math.sin(f.bob) * .05;
+  // parpadeo al recibir daño / estado
+  const flash = f.hitFlash > 0;
+  b.traverse(o => {
+    if (!o.isMesh || !o.material.emissive) return;
+    if (flash) o.material.emissive.setHex(0x883322);
+    else if (f.st.stun > 0) o.material.emissive.setHex(0x554400);
+    else if (f.shield > 0) o.material.emissive.setHex(0x223355);
+    else o.material.emissive.setHex(0x000000);
+  });
+  m.userData.ring.material.opacity = f.st.invuln > 0 ? .3 : .8;
+  // la estela del desplazamiento se deduce de f.dash: no hace falta evento
+  if (f.dash && f.dash.trail && frand() < .5) puff(f.pos, f.dash.trail, 2, .5);
+}
+
+/* ---------- proyectil ---------- */
+function makeProjMesh(p) {
+  const geo = p.flat ? new THREE.BoxGeometry(p.radius * 2.2, .3, .7)
+                     : new THREE.SphereGeometry(Math.max(.18, p.radius * .8), 10, 8);
+  const m = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ color: p.col }));
+  if (!p.flat) m.scale.set(1, 1, p.scale * 1.7);
+  m.position.set(p.x, 1.0, p.z);
+  m.rotation.y = Math.atan2(p.dx, p.dz);
+  scene.add(m);
+  return m;
+}
+function updateProjectileVisual(alpha) {
+  for (const p of G.projectiles) {
+    const m = VIEW.proj.get(p.id);
+    if (m) m.position.set(lerp(p.px, p.x, alpha), 1.0, lerp(p.pz, p.z, alpha));
+  }
+}
+
+/* ---------- zona ---------- */
+function makeZoneMesh(z) {
+  const geo = new THREE.CircleGeometry(z.radius, 40);
+  geo.rotateX(-Math.PI / 2);
+  const disc = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ color: z.col, transparent: true, opacity: .16, depthWrite: false }));
+  disc.position.set(z.x, .06, z.z);
+  scene.add(disc);
+  const rg = new THREE.RingGeometry(z.radius * .96, z.radius, 44);
+  rg.rotateX(-Math.PI / 2);
+  const ring = new THREE.Mesh(rg, new THREE.MeshBasicMaterial({ color: z.col, transparent: true, opacity: .6, depthWrite: false }));
+  ring.position.copy(disc.position);
+  scene.add(ring);
+  return { disc, ring };
+}
+function updateZoneVisual(dt) {
+  for (const z of G.zones) {
+    const v = VIEW.zone.get(z.id);
+    if (!v) continue;
+    if (z.delay > 0) {                    // armándose: parpadeo de aviso
+      v.disc.material.opacity = .05 + Math.abs(Math.sin(G.t * 9)) * .12;
+      continue;
+    }
+    v.ring.rotation.y += dt * .6;
+    v.disc.material.opacity = .13 + Math.sin(G.t * 3) * .03;
+    if (z.rain && frand() < dt * 40) {
+      const a = frand() * TAU, r = Math.sqrt(frand()) * z.radius;
+      rainFx(z.x + Math.cos(a) * r, z.z + Math.sin(a) * r, z.col);
+    }
+  }
+}
+
+/* ---------- orbe ---------- */
+function makePickupMesh(p) {
+  const c = p.type === 'energy' ? 0xffcf5a : 0x5fd39a;
+  const m = new THREE.Mesh(new THREE.OctahedronGeometry(.5, 0), new THREE.MeshStandardMaterial({ color: c, emissive: c, emissiveIntensity: .7, roughness: .3 }));
+  m.position.set(p.x, 1.1, p.z);
+  m.castShadow = true;
+  scene.add(m);
+  const halo = new THREE.Mesh(new THREE.RingGeometry(.7, .95, 24).rotateX(-Math.PI / 2), new THREE.MeshBasicMaterial({ color: c, transparent: true, opacity: .5, depthWrite: false }));
+  halo.position.set(p.x, .08, p.z);
+  scene.add(halo);
+  return { mesh: m, halo };
+}
+function updatePickupVisual(dt) {
+  for (const p of G.pickups) {
+    const v = VIEW.pickup.get(p.id);
+    if (!v) continue;
+    v.mesh.rotation.y += dt * 1.8;
+    v.mesh.position.y = 1.1 + Math.sin(p.t * 2.4) * .18;
+    v.halo.scale.setScalar(1 + Math.sin(p.t * 2.4) * .08);
+  }
+}
+
+/* ---------- el borde de la arena ---------- */
+function updateArenaVisual() {
+  sdRing.visible = G.started && G.sudden;
+  if (G.sudden) {
+    sdRing.scale.set(G.shrink, 1, G.shrink);
+    sdRing.material.opacity = .55 + Math.abs(Math.sin(G.t * 4)) * .45;
+    ringMesh.material.opacity = .25;
+  } else ringMesh.material.opacity = .85;
+}
+
+/* ---------- una pasada completa ---------- */
+const _uidOf = f => f.uid, _idOf = e => e.id;
+function syncView(alpha, dt) {
+  syncGroup(G.fighters, VIEW.fighter, _uidOf, makeFighterMesh, disposeMesh);
+  syncGroup(G.projectiles, VIEW.proj, _idOf, makeProjMesh, disposeMesh);
+  syncGroup(G.zones, VIEW.zone, _idOf, makeZoneMesh, v => { disposeMesh(v.disc); disposeMesh(v.ring); });
+  syncGroup(G.pickups, VIEW.pickup, _idOf, makePickupMesh, v => { disposeMesh(v.mesh); disposeMesh(v.halo); });
+
+  for (const f of G.fighters) updateFighterVisual(f, alpha);
+  updateProjectileVisual(alpha);
+  updateZoneVisual(dt);
+  updatePickupVisual(dt);
+  updateArenaVisual();
+}
+/* ============================ vista: efectos y sonido ============================ */
+/* Partículas, números flotantes, síntesis de audio, y el consumidor de la cola
+   de eventos. Nada de aquí escribe en el estado de juego.                  */
+const FX = [];
+
+/* ============================ efectos ============================ */
+function puff(pos, col, n, scale) {
+  for (let i = 0; i < n; i++) {
+    const m = new THREE.Mesh(new THREE.SphereGeometry((scale || 1) * frnd(.08, .2), 6, 5), new THREE.MeshBasicMaterial({ color: col, transparent: true, opacity: .9 }));
+    m.position.set(pos.x + frnd(-.4, .4), (pos.y || 0) + frnd(.3, 1.5), pos.z + frnd(-.4, .4));
+    scene.add(m);
+    FX.push({ mesh: m, t: 0, dur: frnd(.3, .7), vy: frnd(1, 4), vx: frnd(-2.5, 2.5), vz: frnd(-2.5, 2.5), kind: 'puff' });
+  }
+}
+function hitFx(x, z, col) {
+  const m = new THREE.Mesh(new THREE.SphereGeometry(.34, 8, 6), new THREE.MeshBasicMaterial({ color: col, transparent: true, opacity: .9 }));
+  m.position.set(x, 1.0, z);
+  scene.add(m);
+  FX.push({ mesh: m, t: 0, dur: .2, kind: 'pop' });
+}
+function ringFx(pos, radius, col) {
+  const g = new THREE.RingGeometry(radius * .82, radius, 48);
+  g.rotateX(-Math.PI / 2);
+  const m = new THREE.Mesh(g, new THREE.MeshBasicMaterial({ color: col, transparent: true, opacity: .85, depthWrite: false, side: THREE.DoubleSide }));
+  m.position.set(pos.x, .12, pos.z);
+  m.scale.setScalar(.25);
+  scene.add(m);
+  FX.push({ mesh: m, t: 0, dur: .45, kind: 'ring' });
+}
+function arcFx(pos, a0, half, range, col) {
+  const shape = new THREE.Shape();
+  shape.moveTo(0, 0);
+  shape.absarc(0, 0, range, -half + Math.PI / 2, half + Math.PI / 2, false);
+  shape.lineTo(0, 0);
+  const g = new THREE.ShapeGeometry(shape, 12);
+  g.rotateX(-Math.PI / 2);
+  const m = new THREE.Mesh(g, new THREE.MeshBasicMaterial({ color: col, transparent: true, opacity: .45, side: THREE.DoubleSide, depthWrite: false }));
+  m.position.set(pos.x, .14, pos.z);
+  m.rotation.y = a0 + Math.PI;
+  scene.add(m);
+  FX.push({ mesh: m, t: 0, dur: .22, kind: 'fade' });
+}
+function rainFx(x, z, col) {
+  const m = new THREE.Mesh(new THREE.CylinderGeometry(.04, .04, 1.1, 4), new THREE.MeshBasicMaterial({ color: col }));
+  m.position.set(x, 7, z);
+  scene.add(m);
+  FX.push({ mesh: m, t: 0, dur: .5, vy: -18, kind: 'fall' });
+}
+function updateFx(dt) {
+  for (let i = FX.length - 1; i >= 0; i--) {
+    const e = FX[i];
+    e.t += dt;
+    const k = e.t / e.dur;
+    if (e.kind === 'puff') {
+      e.mesh.position.x += e.vx * dt; e.mesh.position.z += e.vz * dt;
+      e.mesh.position.y += (e.vy - k * 6) * dt;
+      e.mesh.material.opacity = .9 * (1 - k);
+    } else if (e.kind === 'pop') {
+      e.mesh.scale.setScalar(1 + k * 2.2);
+      e.mesh.material.opacity = .9 * (1 - k);
+    } else if (e.kind === 'ring') {
+      e.mesh.scale.setScalar(.25 + k * .85);
+      e.mesh.material.opacity = .85 * (1 - k);
+    } else if (e.kind === 'fade') {
+      e.mesh.material.opacity = .45 * (1 - k);
+    } else if (e.kind === 'fall') {
+      e.mesh.position.y += e.vy * dt;
+      if (e.mesh.position.y < .2) e.t = e.dur;
+    }
+    if (e.t >= e.dur) {
+      scene.remove(e.mesh);
+      e.mesh.geometry.dispose(); e.mesh.material.dispose();
+      FX.splice(i, 1);
+    }
+  }
+}
+
+/* ============================ sonido ============================ */
+const SFX = {
+  ctx: null, gain: null, on: true,
+  init() {
+    if (this.ctx) return;
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return;
+    this.ctx = new AC();
+    this.gain = this.ctx.createGain();
+    this.gain.gain.value = .22;
+    this.gain.connect(this.ctx.destination);
+  },
+  tone(f0, f1, dur, type, vol, delay) {
+    if (!this.on || !this.ctx) return;
+    const t = this.ctx.currentTime + (delay || 0);
+    const o = this.ctx.createOscillator(), g = this.ctx.createGain();
+    o.type = type || 'square';
+    o.frequency.setValueAtTime(f0, t);
+    o.frequency.exponentialRampToValueAtTime(Math.max(30, f1), t + dur);
+    g.gain.setValueAtTime(0, t);
+    g.gain.linearRampToValueAtTime(vol == null ? .5 : vol, t + .008);
+    g.gain.exponentialRampToValueAtTime(.0008, t + dur);
+    o.connect(g); g.connect(this.gain);
+    o.start(t); o.stop(t + dur + .03);
+  },
+  noise(dur, vol, hp) {
+    if (!this.on || !this.ctx) return;
+    const n = Math.floor(this.ctx.sampleRate * dur);
+    const buf = this.ctx.createBuffer(1, n, this.ctx.sampleRate);
+    const d = buf.getChannelData(0);
+    for (let i = 0; i < n; i++) d[i] = (frand() * 2 - 1) * (1 - i / n);   /* ruido: presentación */
+    const s = this.ctx.createBufferSource(); s.buffer = buf;
+    const f = this.ctx.createBiquadFilter(); f.type = 'highpass'; f.frequency.value = hp || 600;
+    const g = this.ctx.createGain(); g.gain.value = vol == null ? .3 : vol;
+    s.connect(f); f.connect(g); g.connect(this.gain); s.start();
+  },
+};
+
+function clearFx() {
+  for (const e of FX) disposeMesh(e.mesh);
+  FX.length = 0;
+}
+
+/* ---------- sonidos con nombre ---------- */
+/* La simulación pide `sfx('pierce')`, no una frecuencia: los números viven
+   aquí, donde se pueden retocar sin tocar un kit de campeón. */
+const SOUNDS = {
+  shot: s => s.tone(760, 320, .09, 'square', .18),
+  hit: s => { s.tone(200, 90, .12, 'sawtooth', .22); s.noise(.07, .12, 900); },
+  big: s => { s.tone(160, 48, .34, 'sawtooth', .3); s.noise(.2, .2, 300); },
+  heal: s => s.tone(520, 880, .2, 'sine', .2),
+  dash: s => s.noise(.18, .16, 1400),
+  cast: s => s.tone(300, 620, .12, 'triangle', .15),
+  ult: s => { s.tone(120, 500, .5, 'sawtooth', .28); s.tone(240, 1000, .5, 'square', .12, .05); },
+  die: s => s.tone(300, 60, .5, 'sawtooth', .26),
+  orb: s => s.tone(660, 1320, .16, 'sine', .2),
+  round: s => { s.tone(392, 392, .16, 'triangle', .26); s.tone(523, 523, .16, 'triangle', .26, .16); s.tone(784, 784, .3, 'triangle', .3, .32); },
+  win: s => [523, 659, 784, 1046].forEach((f, i) => s.tone(f, f, .3, 'triangle', .26, i * .12)),
+  lose: s => [440, 370, 294, 220].forEach((f, i) => s.tone(f, f, .34, 'sine', .24, i * .14)),
+  tick: s => s.tone(900, 900, .06, 'square', .14),
+  go: s => s.tone(660, 990, .3, 'triangle', .3),
+  sudden: s => s.tone(220, 110, .7, 'sawtooth', .3),
+  // habilidades
+  pierce: s => s.tone(520, 200, .18, 'sawtooth', .22),
+  smoke: s => s.noise(.3, .18, 400),
+  slash: s => s.tone(380, 150, .1, 'square', .18),
+  slash3: s => s.tone(260, 150, .1, 'square', .18),
+  charge: s => s.tone(140, 300, .3, 'sawtooth', .22),
+  fortify: s => s.tone(180, 420, .25, 'triangle', .2),
+  chain: s => s.tone(420, 180, .2, 'square', .18),
+  sanctuary: s => s.tone(440, 660, .3, 'sine', .2),
+  aegis: s => s.tone(300, 700, .22, 'sine', .2),
+  flare: s => s.tone(880, 1400, .16, 'sine', .2)
+};
+function playSound(id) {
+  const fn = SOUNDS[id];
+  if (fn) fn(SFX);
+}
+
+/* ============================ la cola de eventos ============================ */
+/* El único sitio donde lo que ocurrió en la simulación se convierte en algo que
+   se ve o se oye. Los eventos traen ids y números; los nombres, los colores y
+   las palabras se resuelven aquí. Lo que es de interfaz se delega en uiEvent.
+
+   Cuando exista el modo online, esta misma función consumirá los eventos que
+   lleguen por la red sin cambiar una línea. */
+const CC_WORD = { stun: 'Aturdido', root: 'Raíz', silence: 'Silencio', immune: 'Inmune' };
+
+function drainEvents() {
+  for (const ev of G.events) {
+    switch (ev.e) {
+      case 'sfx': playSound(ev.id); break;
+      case 'num': floatNum(ev, ev.text, ev.cls); break;
+      case 'hit': hitFx(ev.x, ev.z, ev.col); break;
+      case 'puff': puff(ev, ev.col, ev.n, ev.scale); break;
+      case 'ring': ringFx(ev, ev.radius, ev.col); break;
+      case 'arc': arcFx(ev, ev.a0, ev.half, ev.range, ev.col); break;
+      case 'shake': shake(ev.a); break;
+      case 'clearFx': clearFx(); break;
+
+      case 'dmg': {
+        floatNum(ev, Math.round(ev.dmg), ev.dmg >= 18 ? 'crit' : 'dmg');
+        const me = G.player ? G.player.uid : 0;
+        if (me && (ev.id === me || ev.byId === me)) playSound('hit');
+        break;
+      }
+      case 'heal': floatNum(ev, '+' + ev.amount, 'heal'); break;
+      case 'cc': floatNum(ev, CC_WORD[ev.type] || ev.type, 'en'); break;
+      case 'evade': floatNum(ev, 'Evadido', 'en'); break;
+
+      case 'kill': {
+        const f = fighterById(ev.id), who = fighterById(ev.byId);
+        if (f) { puff(f.pos, TEAM_COL[f.team], 26); playSound('die'); }
+        if (ev.first && who) feed(`${nameTag(who)} abre el marcador`);
+        feed(who && f ? `${nameTag(who)} elimina a ${nameTag(f)}`
+          : f ? `${nameTag(f)} cae al vacío` : '');
+        if (f && f === G.player) shake(.7);
+        break;
+      }
+      case 'orb': {
+        playSound('orb');
+        if (ev.kind === 'energy') {
+          const f = fighterById(ev.byId);
+          if (f) floatNum(f.pos, '+38 energía', 'en');
+        }
+        break;
+      }
+
+      default: uiEvent(ev);
+    }
+  }
+  G.events.length = 0;
+}
+
+function nameTag(f) { return `<b class="${f.team ? 'b' : 'a'}">${f.name}</b>`; }
 /* ============================ interfaz ============================ */
 const KEYLBL = { M1: 'Clic', M2: 'Der.', SP: 'Esp', Q: 'Q', E: 'E', F: 'F', R: 'R' };
 const UI = {};
 let plateHost, numPool = [];
+/* Las placas y los marcos son elementos del DOM, así que viven aquí en
+   mapas por id, nunca colgados del luchador. */
+const PLATE = new Map(), FRAME = new Map();
+let announceT = 0;
 
 function initUI() {
   UI.hud = $('hud'); UI.world = $('world');
@@ -2243,7 +2598,7 @@ function initUI() {
   $('go-help').onclick = () => showScreen('scr-help');
   $('help-back').onclick = () => showScreen(G.state === 'title' ? 'scr-title' : 'scr-title');
   $('setup-back').onclick = () => showScreen('scr-title');
-  $('setup-start').onclick = () => startMatch();
+  $('setup-start').onclick = () => { SFX.init(); startMatch(); };
   $('result-again').onclick = () => { showScreen('scr-setup'); };
   $('result-menu').onclick = () => { showScreen('scr-title'); };
   $('pause-resume').onclick = () => togglePause();
@@ -2294,7 +2649,6 @@ function initUI() {
     <b>Shift + habilidad</b><span>Versión mejorada (50 energía)</span>`;
 }
 
-const SEL = { mode: 'duo', diff: 'normal', champ: 'vesk' };
 function syncOpts() {
   for (const b of document.querySelectorAll('#opt-mode .opt')) b.setAttribute('aria-pressed', b.dataset.v === SEL.mode);
   for (const b of document.querySelectorAll('#opt-diff .opt')) b.setAttribute('aria-pressed', b.dataset.v === SEL.diff);
@@ -2315,7 +2669,7 @@ function hideScreens() { for (const s of document.querySelectorAll('.screen')) s
 function announce(big, sub, dur) {
   const a = $('announce');
   a.innerHTML = `<div class="big pop">${big}</div>${sub ? `<div class="sub pop">${sub}</div>` : ''}`;
-  G.announceT = dur || 1.6;
+  announceT = dur || 1.6;
 }
 function clearAnnounce() { $('announce').innerHTML = ''; }
 function feed(html) {
@@ -2356,15 +2710,16 @@ function makePlate(f) {
     <div class="cast"><i></i></div>`;
   d.q = { cc: d.querySelector('.cc'), hp: d.querySelector('.hp'), sh: d.querySelector('.sh'), cast: d.querySelector('.cast'), castI: d.querySelector('.cast i') };
   plateHost.appendChild(d);
-  f.plate = d;
+  PLATE.set(f.uid, d);
 }
 function updatePlates() {
   for (const f of G.fighters) {
-    const d = f.plate;
-    if (!d) continue;
+    const d = PLATE.get(f.uid), m = VIEW.fighter.get(f.uid);
+    if (!d || !m) continue;
     if (!f.alive) { d.style.display = 'none'; continue; }
     d.style.display = '';
-    tmpV.set(f.mesh.position.x, 2.35, f.mesh.position.z).project(camera);
+    // la placa sigue a la malla, que ya está interpolada, no al último paso
+    tmpV.set(m.position.x, 2.35, m.position.z).project(camera);
     d.style.transform = `translate(${(tmpV.x * .5 + .5) * window.innerWidth}px,${(-tmpV.y * .5 + .5) * window.innerHeight}px) translate(-50%,-100%)`;
     d.q.hp.style.transform = `scaleX(${clamp(f.hp / f.maxHp, 0, 1)})`;
     d.q.sh.style.transform = `scaleX(${clamp(f.shield / f.maxHp, 0, 1)})`;
@@ -2426,7 +2781,7 @@ function buildTeamFrames() {
       <div class="hpb"><i class="sh"></i><i class="hp"></i></div><div class="enb"><i></i></div></div>`;
     d.q = { hp: d.querySelector('.hp'), sh: d.querySelector('.sh'), en: d.querySelector('.enb i'), n: d.querySelector('.hpn') };
     host.appendChild(d);
-    f.frame = d;
+    FRAME.set(f.uid, d);
   }
   for (const side of ['a', 'b']) {
     const box = $('pips-' + side);
@@ -2470,7 +2825,7 @@ function updateHUD() {
   }
 
   for (const o of G.fighters) {
-    const d = o.frame;
+    const d = FRAME.get(o.uid);
     if (!d) continue;
     d.classList.toggle('dead', !o.alive);
     d.classList.toggle('ult', o.alive && o.energy >= 100 - (o.mods.ultCost || 0));
@@ -2509,158 +2864,228 @@ function updateHUD() {
   $('vignette').style.opacity = f.alive ? String(clamp(1 - f.hp / f.maxHp / .45, 0, 1) * .8) : '.8';
 }
 
-/* ============================ partida ============================ */
-function spawnPoints(team, n) {
-  const x = team === 0 ? -14.5 : 14.5;
-  const out = [];
-  for (let i = 0; i < n; i++) out.push({ x, z: (i - (n - 1) / 2) * 3.4, a: team === 0 ? Math.PI / 2 : -Math.PI / 2 });
+/* ============================ entrada ============================ */
+const Input = {
+  keys: Object.create(null), mouse: { x: 0, y: 0 }, m1: false, m2: false, shift: false,
+  aim: new THREE.Vector3(1, 0, 0), aimDir: { x: 1, z: 0 },
+  touch: false, moveVec: { x: 0, z: 0 }, tAim: { x: 0, z: 0 }, tFire: false,
+  queued: null
+};
+const _ray = new THREE.Raycaster(), _plane = new THREE.Plane(new THREE.Vector3(0, 1, 0), -1.0), _ndc = new THREE.Vector2();
+
+function screenToGround(cx, cy, out) {
+  _ndc.set((cx / window.innerWidth) * 2 - 1, -(cy / window.innerHeight) * 2 + 1);
+  _ray.setFromCamera(_ndc, camera);
+  if (!_ray.ray.intersectPlane(_plane, out)) out.set(0, 1, 0);
   return out;
 }
 
-/* `seed` sirve para repetir una partida entera: con la misma semilla y la
-   misma entrada, el combate se desarrolla igual paso a paso. Si no se pasa, se
-   sortea una y se guarda en G.seed. */
-function startMatch(seed) {
-  SFX.init();
-  quitMatch();
-  G.seed = seed === undefined ? (frand() * 0xFFFFFFFF) >>> 0 : (seed >>> 0);
-  seedSim(G.seed);
-  G.mode = MODES[SEL.mode];
-  G.diff = SEL.diff;
-  G.wins = G.mode.wins;
-  G.round = 1; G.score = [0, 0]; G.picks = 0;
-  G.playerTeam = 0;
-  G.roundLimit = G.mode.time || 9999;
+function initInput() {
+  addEventListener('keydown', e => {
+    const k = e.key.toLowerCase();
+    if (k === 'shift') Input.shift = true;
+    Input.keys[k] = true;
+    if (k === 'escape') { e.preventDefault(); togglePause(); }
+    if ([' ', 'q', 'e', 'r', 'f', 'w', 'a', 's', 'd'].includes(k)) e.preventDefault();
+  });
+  addEventListener('keyup', e => {
+    const k = e.key.toLowerCase();
+    if (k === 'shift') Input.shift = false;
+    Input.keys[k] = false;
+  });
+  addEventListener('blur', () => { Input.keys = Object.create(null); Input.m1 = Input.m2 = false; });
+  const cv = $('gl');
+  cv.addEventListener('contextmenu', e => e.preventDefault());
+  addEventListener('pointermove', e => {
+    if (e.pointerType === 'touch') return;
+    Input.mouse.x = e.clientX; Input.mouse.y = e.clientY;
+  });
+  cv.addEventListener('pointerdown', e => {
+    if (e.pointerType === 'touch') return;
+    if (e.button === 0) Input.m1 = true;
+    if (e.button === 2) Input.m2 = true;
+  });
+  addEventListener('pointerup', e => {
+    if (e.pointerType === 'touch') return;
+    if (e.button === 0) Input.m1 = false;
+    if (e.button === 2) Input.m2 = false;
+  });
+  Input.touch = matchMedia('(pointer:coarse)').matches;
+  if (Input.touch) initTouch();
+}
 
-  const n = G.mode.size;
-  // composición: nunca repetir campeón dentro de un equipo si se puede evitar
-  const teamComp = t => {
-    const list = [];
-    const rest = CHAMP_LIST.filter(c => !(t === 0 && c === SEL.champ));
-    if (t === 0) list.push(SEL.champ);
-    const order = t === 0 ? ['brakk', 'lumen', 'vesk'] : ['lumen', 'vesk', 'brakk'];
-    for (const c of order) {
-      if (list.length >= n) break;
-      if (list.includes(c)) continue;
-      if (t === 0 && !rest.includes(c)) continue;
-      list.push(c);
-    }
-    while (list.length < n) list.push(pickOne(CHAMP_LIST));
-    return list.slice(0, n);
+function updateAim() {
+  if (Input.touch && (Input.tAim.x || Input.tAim.z)) {
+    Input.aimDir.x = Input.tAim.x; Input.aimDir.z = Input.tAim.z;
+    if (G.player) Input.aim.set(G.player.pos.x + Input.tAim.x * 12, 1, G.player.pos.z + Input.tAim.z * 12);
+    return;
+  }
+  screenToGround(Input.mouse.x, Input.mouse.y, Input.aim);
+  if (G.player) {
+    const dx = Input.aim.x - G.player.pos.x, dz = Input.aim.z - G.player.pos.z;
+    const d = Math.hypot(dx, dz) || 1;
+    Input.aimDir.x = dx / d; Input.aimDir.z = dz / d;
+  }
+}
+
+function moveInput() {
+  if (Input.touch) return { x: Input.moveVec.x, z: Input.moveVec.z };
+  let x = 0, z = 0;
+  if (Input.keys['w'] || Input.keys['arrowup']) z -= 1;
+  if (Input.keys['s'] || Input.keys['arrowdown']) z += 1;
+  if (Input.keys['a'] || Input.keys['arrowleft']) x -= 1;
+  if (Input.keys['d'] || Input.keys['arrowright']) x += 1;
+  const d = Math.hypot(x, z);
+  return d > 0 ? { x: x / d, z: z / d } : { x: 0, z: 0 };
+}
+
+/* Muestrear es cosa de la vista: lee el teclado, el ratón o los joysticks y
+   produce el comando que define 10_core.js. Aplicarlo es cosa de la
+   simulación (`applyInput`, en 30_combat.js). */
+function sampleInput(seq) {
+  updateAim();
+  const f = G.player;
+  const mv = moveInput();
+  const dx = Input.aim.x - (f ? f.pos.x : 0), dz = Input.aim.z - (f ? f.pos.z : 0);
+  let buttons = 0, ex = Input.shift || Input.exMode;
+  if (Input.queued) {
+    buttons |= 1 << Input.queued.i;
+    if (Input.queued.ex) ex = true;
+    Input.queued = null;
+    if (Input.exMode) { Input.exMode = false; syncEx(); }
+  }
+  if (Input.m1 || (Input.touch && Input.tFire)) buttons |= BTN.M1;
+  if (Input.m2) buttons |= BTN.M2;
+  if (Input.keys[' ']) buttons |= BTN.SP;
+  if (Input.keys['q']) buttons |= BTN.Q;
+  if (Input.keys['e']) buttons |= BTN.E;
+  if (Input.keys['f']) buttons |= BTN.F;
+  if (Input.keys['r']) buttons |= BTN.R;
+  return {
+    seq,
+    move: (mv.x || mv.z) ? dirToByte(mv.x, mv.z) : CMD_STILL,
+    aim: dirToByte(Input.aimDir.x, Input.aimDir.z),
+    aimD: clamp(Math.round(Math.hypot(dx, dz) * 10), 0, 255),
+    buttons, ex: ex ? 1 : 0
   };
-  for (let t = 0; t < 2; t++) {
-    const comp = teamComp(t);
-    comp.forEach((cid, i) => {
-      const isBot = !(t === 0 && i === 0);
-      const f = makeFighter(cid, t, isBot, isBot ? BOT_NAMES[t][i % 4] : 'Tú');
-      if (isBot) makeAI(f, G.diff);
-      else G.player = f;
-      G.fighters.push(f);
-      makePlate(f);
+}
+
+/* --- controles táctiles --- */
+function initTouch() {
+  $('touch').classList.remove('hidden');
+  const mk = (node, onMove, onEnd) => {
+    let id = null; const R = 52;
+    const nub = node.querySelector('.nub');
+    const rect = () => node.getBoundingClientRect();
+    node.addEventListener('pointerdown', e => {
+      if (id !== null) return;
+      id = e.pointerId; node.setPointerCapture(id); handle(e);
     });
-  }
-  buildAbilityBar(G.player.champ);
-  buildTeamFrames();
-  hideScreens();
-  G.started = true;
-  if (G.mode.id === 'training') { beginRound(); announce('Entrenamiento', 'Los bots reaparecen solos', 2); }
-  else openRelicPick();
+    node.addEventListener('pointermove', e => { if (e.pointerId === id) handle(e); });
+    const up = e => {
+      if (e.pointerId !== id) return;
+      id = null; nub.style.transform = '';
+      onMove(0, 0); if (onEnd) onEnd();
+    };
+    node.addEventListener('pointerup', up);
+    node.addEventListener('pointercancel', up);
+    function handle(e) {
+      const r = rect();
+      let dx = e.clientX - (r.left + r.width / 2), dy = e.clientY - (r.top + r.height / 2);
+      const d = Math.hypot(dx, dy);
+      const k = d > R ? R / d : 1;
+      nub.style.transform = `translate(${dx * k}px,${dy * k}px)`;
+      const n = Math.max(d, 1);
+      onMove(dx / n * Math.min(1, d / R), dy / n * Math.min(1, d / R));
+    }
+  };
+  mk($('stick-l'), (x, y) => { Input.moveVec.x = x; Input.moveVec.z = y; });
+  mk($('stick-r'), (x, y) => {
+    const d = Math.hypot(x, y);
+    if (d > .25) { Input.tAim.x = x / d; Input.tAim.z = y / d; Input.tFire = true; }
+    else Input.tFire = false;
+  }, () => { Input.tFire = false; });
 }
 
-function quitMatch() {
-  for (const f of G.fighters) { scene.remove(f.mesh); if (f.plate) f.plate.remove(); }
-  G.fighters.length = 0;
-  G.byId.clear();
-  _uid = 0;                 // los ids arrancan de cero en cada partida, como en un servidor
-  G.player = null; G.started = false; G.sudden = false; G.shrink = 1;
-  sdRing.visible = false;
-  clearTransient();
-  clearAnnounce();
-  $('feed').innerHTML = '';
-  G.paused = false;
+/* ============================ eventos de partida ============================ */
+/* Lo que la simulación anuncia y que se traduce en pantallas, avisos y texto.
+   La simulación no sabe que «Ronda ganada» se escribe así, ni que hay una
+   pantalla de reliquias: solo dice lo que ha pasado. */
+function uiEvent(ev) {
+  switch (ev.e) {
+    case 'matchStart':
+      buildAbilityBar(G.player.champ);
+      for (const f of G.fighters) makePlate(f);
+      buildTeamFrames();
+      hideScreens();
+      break;
+
+    case 'matchEnd':                       // también al salir al menú
+      for (const d of PLATE.values()) d.remove();
+      PLATE.clear(); FRAME.clear();
+      clearAnnounce();
+      $('feed').innerHTML = '';
+      break;
+
+    case 'training':
+      announce('Entrenamiento', 'Los bots reaparecen solos', 2);
+      break;
+
+    case 'roundStart':
+      if (!ev.training) announce(`Ronda ${ev.round}`, `${ev.score[0]} · ${ev.score[1]}`, 1.7);
+      playSound('round');
+      break;
+
+    case 'roundEnd': {
+      if (ev.winner < 0) { announce('Empate', 'Nadie cede', 3); break; }
+      const pips = $('pips-' + (ev.winner === G.playerTeam ? 'a' : 'b')).children;
+      if (pips[ev.score[ev.winner] - 1]) pips[ev.score[ev.winner] - 1].classList.add('on');
+      const mine = ev.winner === G.playerTeam;
+      announce(mine ? 'Ronda ganada' : 'Ronda perdida',
+        `${ev.score[G.playerTeam]} · ${ev.score[1 - G.playerTeam]}`, 3);
+      playSound(mine ? 'win' : 'lose');
+      break;
+    }
+
+    case 'countdown':
+      if (ev.n > 0) { announce(String(ev.n), '', .9); playSound('tick'); }
+      else { announce('¡Ya!', '', .8); playSound('go'); }
+      break;
+
+    case 'sudden':
+      announce('Muerte súbita', 'La arena se cierra', 2.2);
+      playSound('sudden');
+      break;
+
+    case 'orbSpawn':
+      if (ev.kind === 'energy') feed('Orbe de energía en el centro');
+      break;
+
+    case 'relics': showRelics(ev.picks, ev.of); break;
+    case 'matchResult': showResult(ev.winner); break;
+    case 'pause': ev.on ? showScreen('scr-pause') : hideScreens(); break;
+  }
 }
 
-function beginRound() {
-  const n = G.mode.size;
-  for (const t of [0, 1]) {
-    const pts = spawnPoints(t, n);
-    let i = 0;
-    for (const f of G.fighters) if (f.team === t) { const p = pts[i++]; resetFighter(f, p.x, p.z, p.a); }
-  }
-  clearTransient();
-  G.roundTime = 0; G.sudden = false; G.shrink = 1;
-  G.firstBlood = false;
-  sdRing.visible = false;
-  G.nextOrb = 18; G.nextHeal = 26;
-  G.state = 'intro';
-  G.introT = 3.2;
-  if (G.mode.id !== 'training') announce(`Ronda ${G.round}`, `${G.score[0]} · ${G.score[1]}`, 1.7);
-  SFX.round();
-}
-
-function endRound(winner) {
-  if (G.state !== 'live') return;
-  G.state = 'roundend';
-  G.roundEndT = 3.4;
-  if (winner >= 0) {
-    G.score[winner]++;
-    for (const f of G.fighters) if (f.team === winner) f.stats.rounds++;
-    const pips = $('pips-' + (winner === G.playerTeam ? 'a' : 'b')).children;
-    if (pips[G.score[winner] - 1]) pips[G.score[winner] - 1].classList.add('on');
-    const mine = winner === G.playerTeam;
-    announce(mine ? 'Ronda ganada' : 'Ronda perdida', `${G.score[G.playerTeam]} · ${G.score[1 - G.playerTeam]}`, 3);
-    mine ? SFX.win() : SFX.lose();
-  } else {
-    announce('Empate', 'Nadie cede', 3);
-  }
-  G.timeScale = .35;
-}
-
-function openRelicPick() {
-  G.picks++;
-  G.state = 'brite';
-  const taken = new Set(G.player.relics.map(r => r.id));
-  const pool = RELICS.filter(r => !taken.has(r.id));
-  const opts = [];
-  const byRar = r => pool.filter(x => x.r === r && !opts.includes(x));
-  const wantEpic = G.picks >= 3 ? 1 : 0;
-  while (opts.length < 3) {
-    let cand;
-    if (opts.length === 0) cand = pickOne(byRar('com'));
-    else if (opts.length === 1) cand = pickOne(byRar(chance(.6) ? 'rare' : 'com'));
-    else cand = pickOne(byRar(wantEpic && chance(.55) ? 'epic' : 'rare'));
-    if (!cand) cand = pickOne(pool.filter(x => !opts.includes(x)));
-    if (!cand) break;
-    opts.push(cand);
-  }
-  $('brite-title').textContent = `Reliquia ${G.picks} de ${G.wins + 2}`;
+/* ---------- pantalla de reliquias ---------- */
+/* Las tres opciones las sorteó la simulación y están en G.relicOptions; aquí
+   solo se pintan y se avisa de cuál eligió el jugador. */
+function showRelics(picks, of) {
+  $('brite-title').textContent = `Reliquia ${picks} de ${of}`;
   $('brite-sub').textContent = 'Se queda contigo hasta el final del combate.';
   const box = $('brite-cards');
   box.innerHTML = '';
-  opts.forEach(r => {
+  (G.relicOptions || []).forEach((r, i) => {
     const b = el('button', 'card ' + (r.r === 'com' ? '' : r.r));
     b.innerHTML = `<span class="rune">${r.rune}</span><h4>${r.n}</h4><p>${r.d}</p><span class="tag">${RELIC_TAG[r.r]}</span>`;
-    b.onclick = () => {
-      applyRelic(G.player, r);
-      for (const f of G.fighters) {
-        if (f === G.player || !f.isBot) continue;
-        const own = new Set(f.relics.map(x => x.id));
-        const p = RELICS.filter(x => !own.has(x.id));
-        const three = [pickOne(p), pickOne(p), pickOne(p)].filter(Boolean);
-        const chosen = botPickRelic(f, three.length ? three : [pickOne(RELICS)]);
-        if (chosen) applyRelic(f, chosen);
-      }
-      hideScreens();
-      beginRound();
-    };
+    b.onclick = () => { if (pickRelic(i)) hideScreens(); };
     box.appendChild(b);
   });
   showScreen('scr-brite');
-  G.state = 'brite';
 }
 
-function endMatch(winner) {
-  G.state = 'result';
+/* ---------- pantalla de resultado ---------- */
+function showResult(winner) {
   const mine = winner === G.playerTeam;
   $('result-title').textContent = mine ? 'Victoria' : 'Derrota';
   $('result-sub').textContent = `${G.score[G.playerTeam]} · ${G.score[1 - G.playerTeam]} en ${G.mode.name}. ${mine ? 'La arena es tuya.' : 'La próxima vez.'}`;
@@ -2674,143 +3099,25 @@ function endMatch(winner) {
   }
   showScreen('scr-result');
   clearAnnounce();
-  mine ? SFX.win() : SFX.lose();
+  playSound(mine ? 'win' : 'lose');
 }
 
-function togglePause() {
-  if (!G.started) return;
-  if (G.state === 'brite' || G.state === 'result') return;
-  if (G.paused) { G.paused = false; hideScreens(); }
-  else { G.paused = true; showScreen('scr-pause'); }
+/* El aviso grande se apaga solo, en tiempo real: no depende del ritmo de la
+   simulación, así que la cámara lenta del remate no lo alarga. */
+function tickAnnounce(raw) {
+  if (announceT <= 0) return;
+  announceT -= raw;
+  if (announceT <= 0) clearAnnounce();
 }
-/* ============================ entrada del jugador ============================ */
-/* Muestrear y aplicar son dos pasos separados a propósito: entre medias hay un
-   comando, que es un dato plano. Hoy va directo del teclado a la simulación;
-   con el modo online irá además por la red y se volverá a aplicar al
-   reconciliar. */
-let _cmdSeq = 0;
-function playerControl() {
-  const f = G.player;
-  if (!f || !f.alive) return;
-  applyInput(f, sampleInput(_cmdSeq++));
-}
-
-/* ============================ ritmo de la ronda ============================ */
-function updateRound(dt) {
-  if (G.state === 'intro') {
-    G.introT -= dt;
-    const n = Math.ceil(G.introT - .2);
-    if (n > 0 && n <= 3 && G.introN !== n) { G.introN = n; announce(String(n), '', .9); SFX.tick(); }
-    if (G.introT <= .2 && G.introN !== 0) { G.introN = 0; announce('¡Ya!', '', .8); SFX.tone(660, 990, .3, 'triangle', .3); }
-    if (G.introT <= 0) { G.state = 'live'; G.introN = -1; }
-    return;
-  }
-  if (G.state === 'roundend') {
-    G.roundEndT -= dt;
-    G.timeScale = lerp(G.timeScale, 1, dt * 1.2);
-    if (G.roundEndT <= 0) {
-      G.timeScale = 1;
-      const w = G.score[0] >= G.wins ? 0 : G.score[1] >= G.wins ? 1 : -1;
-      if (w >= 0) endMatch(w);
-      else { G.round++; openRelicPick(); }
-    }
-    return;
-  }
-  if (G.state !== 'live') return;
-
-  G.roundTime += dt;
-
-  // orbes
-  if (G.mode.id !== 'training') {
-    G.nextOrb -= dt;
-    if (G.nextOrb <= 0) { G.nextOrb = 24; spawnPickup('energy', 0, 0); feed('Orbe de energía en el centro'); }
-    G.nextHeal -= dt;
-    if (G.nextHeal <= 0) {
-      G.nextHeal = 30;
-      spawnPickup('health', 0, -9.6);
-      spawnPickup('health', 0, 9.6);
-    }
-  } else {
-    gainEnergy(G.player, dt * 14);
-  }
-
-  // muerte súbita
-  const sdStart = Math.max(30, G.roundLimit - 55);
-  if (G.mode.id !== 'training') {
-    if (!G.sudden && G.roundTime > sdStart) {
-      G.sudden = true;
-      sdRing.visible = true;
-      announce('Muerte súbita', 'La arena se cierra', 2.2);
-      SFX.tone(220, 110, .7, 'sawtooth', .3);
-    }
-    if (G.sudden) {
-      G.shrink = clamp(1 - (G.roundTime - sdStart) / 42 * .72, .26, 1);
-      sdRing.scale.set(G.shrink, 1, G.shrink);
-      sdRing.material.opacity = .55 + Math.abs(Math.sin(G.t * 4)) * .45;
-      ringMesh.material.opacity = .25;
-    } else ringMesh.material.opacity = .85;
-  }
-
-  // fin de ronda
-  let alive = [0, 0];
-  for (const f of G.fighters) if (f.alive) alive[f.team]++;
-  if (G.mode.id === 'training') {
-    for (const f of G.fighters) {
-      if (f.alive) continue;
-      f.deadT2 = (f.deadT2 || 0) + dt;
-      if (f.deadT2 > 3) {
-        f.deadT2 = 0;
-        const pts = spawnPoints(f.team, G.mode.size);
-        const p = pts[0];
-        resetFighter(f, p.x, p.z, p.a);
-      }
-    }
-    return;
-  }
-  if (alive[0] === 0 || alive[1] === 0) {
-    if (alive[0] === 0 && alive[1] === 0) endRound(-1);
-    else endRound(alive[0] === 0 ? 1 : 0);
-    return;
-  }
-  if (G.roundTime >= G.roundLimit) {
-    const r = [0, 0];
-    for (const f of G.fighters) if (f.alive) r[f.team] += f.hp / f.maxHp;
-    endRound(r[0] === r[1] ? -1 : (r[0] > r[1] ? 0 : 1));
-  }
-}
-
-/* ============================ simulación ============================ */
-/* Un paso de simulación. Todo lo que cambia el estado de juego ocurre aquí y
-   solo aquí, siempre con el mismo dt. Lo que queda fuera es vista: se podría
-   quitar entero y la partida acabaría igual. */
-function simStep(dt) {
-  G.dt = dt;
-  // la posición del paso anterior sirve para dos cosas: estimar la velocidad
-  // (la usan los bots al predecir) e interpolar la vista entre pasos
-  for (const f of G.fighters) { f.px = f.pos.x; f.pz = f.pos.z; f.pface = f.face; }
-  for (const p of G.projectiles) { p.px = p.x; p.pz = p.z; }
-
-  playerControl();
-  G.order++;
-  const order = fightersInOrder();
-  if (G.state === 'live') {
-    for (const f of order) if (f.isBot && f.alive) updateAI(f, dt);
-  } else {
-    for (const f of G.fighters) { f.moveDir.x = 0; f.moveDir.z = 0; }
-  }
-  for (const f of order) tickFighter(f, dt);
-  updateProjectiles(dt);
-  updateZones(dt);
-  updatePickups(dt);
-  for (const f of G.fighters) {
-    f.velEst.x = (f.pos.x - f.px) / dt;
-    f.velEst.z = (f.pos.z - f.pz) / dt;
-  }
-  updateRound(dt);
-}
-
 /* ============================ bucle ============================ */
-let _acc = 0;
+/* La frontera del proyecto en una función: arriba se simula, abajo se dibuja.
+
+   El comando de entrada se muestrea aquí y se le pasa a simStep, que no lee
+   el teclado por su cuenta. Cuando exista el modo online, este mismo bucle
+   mandará ese comando por la red en vez de (o además de) aplicarlo en local, y
+   simStep se llamará de nuevo con los comandos sin confirmar al reconciliar. */
+let _acc = 0, _cmdSeq = 0;
+
 function frame() {
   requestAnimationFrame(frame);
   const raw = Math.min(.25, clock.getDelta());
@@ -2823,18 +3130,19 @@ function frame() {
     // remate de ronda da menos pasos, nunca pasos más cortos
     _acc += raw * (G.state === 'roundend' ? G.timeScale : 1);
     let n = 0;
-    while (_acc >= STEP && n < MAX_STEPS) { simStep(STEP); _acc -= STEP; n++; }
+    while (_acc >= STEP && n < MAX_STEPS) {
+      simStep(STEP, G.player ? sampleInput(_cmdSeq++) : null);
+      _acc -= STEP; n++;
+    }
     if (_acc >= STEP) _acc = 0;      // tras un parón el tiempo se pierde, no se recupera
   } else _acc = 0;
 
+  drainEvents();                     // lo ocurrido en la simulación se ve y se oye
+
   const alpha = simming ? _acc / STEP : 1;
-  for (const f of G.fighters) updateFighterVisual(f, alpha);
-  updateProjectileVisual(alpha);
-  if (simming) {
-    updateHUD();
-    updatePlates();
-    if (G.announceT > 0) { G.announceT -= raw; if (G.announceT <= 0) clearAnnounce(); }
-  }
+  syncView(alpha, raw);
+  if (simming) { updateHUD(); updatePlates(); }
+  tickAnnounce(raw);
   updateFx(raw);
   updateFloats(raw);
   updateEmbers(raw);

@@ -17,9 +17,22 @@ docs/                  esta documentación
 ```
 
 No hay empaquetador, ni `package.json`, ni `node_modules`. `build.sh` es un
-`cat` de seis archivos en orden alfabético más el cierre de etiquetas. Todo el
+`cat` de diez archivos en orden numérico más el cierre de etiquetas. Todo el
 juego termina siendo **un solo `<script>` en un solo ámbito global**, y esa
 decisión condiciona casi todo lo demás (ver [CONVENCIONES.md](CONVENCIONES.md)).
+
+**El número del archivo dice de qué mitad es**, y esa es la división más
+importante del proyecto:
+
+| | | |
+|---|---|---|
+| **10 – 50** | simulación | reglas del juego. Corre en Node tal cual, sin three.js ni DOM |
+| **60 – 80** | vista | escena, efectos, sonido, interfaz, entrada |
+| **90** | bucle | lo único que habla con las dos |
+
+La simulación nunca llama a la vista: anota lo ocurrido en una cola de eventos
+(§3) y sigue. Eso es lo que permite que el mismo código corra en un servidor, y
+`tests/lint.js` falla si alguien cruza la línea.
 
 Dependencias en tiempo de ejecución, todas por CDN:
 
@@ -30,10 +43,9 @@ Dependencias en tiempo de ejecución, todas por CDN:
 
 ---
 
-## 2. Las seis capas
+## 2. Las capas
 
-El prefijo numérico **es** el orden de carga y también el orden de dependencia:
-un módulo solo puede usar lo que definieron los anteriores.
+El prefijo numérico **es** el orden de carga y también el orden de dependencia.
 
 ### `00_head.html` — presentación
 
@@ -47,7 +59,7 @@ El HUD es **DOM sobre un canvas**, no texto dibujado en WebGL: las barras son
 coordenadas de mundo a pantalla. Es más barato de iterar y más nítido que
 renderizar texto en 3D.
 
-### `10_core.js` — cimientos
+### `10_core.js` — cimientos *(simulación)*
 
 - **Utilidades**: `clamp`, `lerp`, `dist2`, `angDiff`, `damp`, `vec3`, `$`, `el`.
 - **Aleatoriedad en dos juegos**: `srand`/`rnd`/`irnd`/`pickOne`/`chance` son
@@ -65,18 +77,18 @@ renderizar texto en 3D.
   (no hay assets externos), cámara y `updateCamera`.
 - **`Input`** y el **comando de entrada**: teclado, ratón y joysticks táctiles
   si `pointer:coarse`; `sampleInput(seq)` los convierte en un dato plano.
-- **`SFX`**: síntesis con `OscillatorNode`. No hay archivos de audio.
+- **La cola de eventos**: `emit`, y los atajos `sfx`, `fxNum`, `fxHit`,
+  `fxPuff`, `fxRing`, `fxArc`, `fxShake`. Ver §3.
+- **El comando de entrada**: `CMD_STILL`, `BTN`, `dirToByte`, `byteToDir`. El
+  formato es contrato de simulación; quien lo produce leyendo el teclado es la
+  vista.
 
-### `20_champs.js` — datos de campeones
+### `20_champs.js` — datos de campeones *(simulación)*
 
-`CHAMPS` es un diccionario de definiciones. Cada campeón mezcla **tres cosas
-distintas** en el mismo objeto, y esa mezcla es la deuda técnica principal de
-cara al modo online (ver [ONLINE.md](ONLINE.md) §3):
-
-1. **Estadísticas** — `hp`, `speed`, `role`, `stats`. Simulación pura.
-2. **`build(g)`** — mallas de three.js. Presentación pura.
-3. **`ab[]`** — siete habilidades. Simulación *y* presentación mezcladas: cada
-   `act(f, o)` aplica el efecto **y** llama a `SFX.*` directamente.
+`CHAMPS` es un diccionario de definiciones: `hp`, `speed`, `role`, `stats` y las
+siete habilidades. Solo reglas y números — las mallas están en `CHAMP_MESH` de
+`60_view.js` y los sonidos salen como eventos `sfx('nombre')` que `70_fx.js`
+traduce a osciladores.
 
 El orden de `ab` es **fijo y significativo**: `M1, M2, SP, Q, E, F, R`. El HUD,
 el mapeo de teclas y los planes de bot lo dan por hecho por índice, no por
@@ -86,7 +98,7 @@ nombre.
 muta `f.mods` o `f.maxHp`. Se aplican al empezar la ronda y no se deshacen: la
 partida se reconstruye entera al salir.
 
-### `30_combat.js` — la simulación
+### `30_combat.js` — combate *(simulación)*
 
 El corazón. Define las entidades y las primitivas con las que se escribe
 cualquier habilidad:
@@ -120,9 +132,9 @@ Y las reglas transversales:
   y entonces el resto **no corre**. Ese `return` temprano es la razón de que un
   desplazamiento te saque limpiamente de una situación.
 
-### `40_ai.js` — bots
+### `40_ai.js` — bots *(simulación)*
 
-`updateAI(f, dt)` produce, cada fotograma, un `moveDir` y un `aimDir` —
+`updateAI(f, dt)` produce, cada paso, un `moveDir` y un `aimDir` —
 exactamente las mismas dos entradas que produce el jugador humano. **Los bots no
 hacen trampas**: pasan por `tryCast` como todo el mundo.
 
@@ -138,19 +150,38 @@ predice la posición futura del objetivo con `predictPos` usando `velEst`.
 `null`. Es una lista de reglas con probabilidades, no un árbol de comportamiento.
 Un campeón sin plan cae en `_default` y solo usa el básico.
 
-### `50_match_ui.js` — partida e interfaz
+### `50_match.js` — partida *(simulación)*
 
-Dos responsabilidades que conviene no confundir:
+La máquina de estados del combate: `startMatch`, `beginRound`, `endRound`,
+`openRelicPick`, `pickRelic`, `endMatch`, `quitMatch`, `updateRound`, y
+**`simStep(dt, cmd)`**, el paso de simulación.
 
-- **Partida**: `startMatch`, `beginRound`, `endRound`, `openRelicPick`,
-  `endMatch`, `quitMatch`. La máquina de estados.
-- **Interfaz**: HUD, placas sobre personajes, números flotantes, marcos de
-  equipo, pantallas.
+No toca el DOM: anuncia por eventos y deja las tres opciones de reliquia en
+`G.relicOptions` para que las pinte quien quiera. Es, tal cual, lo que
+gobernaría un servidor de partida.
 
-### `60_loop.js` — pegamento
+### `60_view.js` — escena *(vista)*
 
-`playerControl()` (entrada → intenciones), `updateRound(dt)` (ritmo de ronda,
-orbes, muerte súbita, condición de victoria) y `frame()`, el bucle.
+three.js, luces, suelo, cámara, las mallas de cada campeón (`CHAMP_MESH`) y
+**`syncView()`**, que mantiene la escena al día recorriendo las listas de
+entidades: crea la malla de las nuevas, destruye la de las que ya no están.
+Las mallas viven en mapas indexados por id, nunca colgadas de la entidad.
+
+### `70_fx.js` — efectos y sonido *(vista)*
+
+Partículas, la tabla de sonidos por nombre (`SOUNDS`) y **`drainEvents()`**, el
+único sitio donde lo que pasó en la simulación se convierte en algo que se ve o
+se oye. Aquí se decide que `{e:'kill', id, byId}` se lee «Vesk elimina a Brakk».
+
+### `80_ui.js` — interfaz y entrada *(vista)*
+
+HUD, placas, números flotantes, marcos de equipo, pantallas, `uiEvent()` para
+los eventos de partida, y la entrada: `Input`, `sampleInput()`, táctil.
+
+### `90_loop.js` — el bucle
+
+`frame()` y `boot()`. La frontera del proyecto en una función: muestrea el
+comando, llama a `simStep`, vacía la cola de eventos y dibuja.
 
 ---
 
@@ -349,11 +380,11 @@ hace lo propio con el DOM. Eso permite ejecutar **la lógica real, sin tocar ni
 una línea**, en Node:
 
 ```bash
-node tests/sim.js           # 12 rondas de bots contra bots, 3v3, ~300 ms
+node tests/sim.js           # 12 rondas de bots 3v3, sin dobles, ~250 ms
 node tests/e2e.js           # menú → partida → rondas → reliquias → resultado
 node tests/determinism.js   # misma semilla ⇒ misma partida
 node tests/input_cmd.js     # cuantización, botones y punto de apuntado
-node tests/lint_rng.js      # ningún Math.random en el camino de simulación
+node tests/lint.js          # azar con semilla y frontera simulación/vista
 ```
 
 `sim.js` además verifica invariantes duros: posiciones `NaN` y luchadores fuera

@@ -12,7 +12,7 @@ Estas cinco rompen el juego de formas que no dan error en consola:
 1. **No edites `crisol-arena.html`.** Es salida de `build.sh`. Cualquier cambio
    ahí desaparece en la siguiente compilación. Se edita `src/`, se ejecuta
    `./build.sh`.
-2. **Un solo ámbito global.** Los seis archivos se concatenan en un `<script>`.
+2. **Un solo ámbito global.** Los diez archivos se concatenan en un `<script>`.
    Dos `const` con el mismo nombre en archivos distintos es un `SyntaxError` que
    deja la página en blanco sin más pistas. Antes de crear un nombre de nivel
    superior: `grep -rn "nombre" src/`.
@@ -29,9 +29,14 @@ Estas cinco rompen el juego de formas que no dan error en consola:
    `pickOne` y `chance` llevan semilla; `frand`, `frnd` y `firnd` son para
    partículas y adornos. Un `Math.random()` en el camino de simulación rompe el
    determinismo sin dar ningún error, y ese es el fallo más caro de encontrar
-   que tiene este proyecto por delante. `node tests/lint_rng.js` lo impide.
+   que tiene este proyecto por delante. `node tests/lint.js` lo impide.
 7. **Lo que cambia el estado va en `simStep`, y recibe `STEP`.** Nunca `raw`, ni
    el delta del fotograma. Lo que dibuja va en `frame` y puede usar `raw`.
+8. **La simulación (10-50) no puede tocar la vista.** Ni `THREE`, ni `document`,
+   ni `scene`, ni `SFX`. Si algo tiene que verse u oírse, sale por la cola de
+   eventos: `sfx('shot')`, `fxRing(pos, r, col)`, `emit({e:'kill', id, byId})`.
+   Cruzar esa línea ata el juego al navegador y mata el servidor antes de que
+   exista. `node tests/lint.js` también lo impide.
 
 ---
 
@@ -110,7 +115,7 @@ La versión está fijada en `00_head.html`. La API de r128 no es la actual, y la
 diferencia muerde:
 
 - **No existe `CapsuleGeometry`.** Los personajes se montan con cilindros,
-  esferas y conos (`limb()` en `20_champs.js`).
+  esferas y conos (`limb()` y `CHAMP_MESH`, en `60_view.js`).
 - **`ExtrudeGeometry` crece hacia +Y** después de rotar la forma. Hay que bajar
   la malla por su `boundingBox.max.y` o los personajes quedan hundidos en la
   plataforma.
@@ -130,11 +135,11 @@ después.
 
 ```bash
 ./build.sh                  # src/ → crisol-arena.html
-node tests/sim.js           # equilibrio y salud de la simulación (~300 ms)
+node tests/sim.js           # equilibrio y salud de la simulación (~250 ms)
 node tests/e2e.js           # recorrido completo del juego
 node tests/determinism.js   # misma semilla ⇒ misma partida
 node tests/input_cmd.js     # el comando de entrada, de punta a punta
-node tests/lint_rng.js      # ningún Math.random en el camino de simulación
+node tests/lint.js          # azar con semilla y frontera simulación/vista
 ```
 
 El ciclo normal es: editar `src/` → `./build.sh` → recargar el navegador. Los
@@ -142,9 +147,13 @@ tests no necesitan compilar; leen `src/` directamente.
 
 **Antes de dar algo por terminado, los cinco tests pasan.** `sim.js` lanza
 excepción con posiciones `NaN` o luchadores fuera de la arena; `e2e.js` recorre
-menú, rondas, reliquias y resultado; `determinism.js` protege lo que costó
-conseguir en la etapa 1. Entre todos cogen la mayoría de las regresiones
-estructurales.
+menú, rondas, reliquias y resultado; `determinism.js` y `lint.js` protegen lo
+que costó conseguir en las etapas 1 y 2. Entre todos cogen la mayoría de las
+regresiones estructurales.
+
+Que `sim.js` no cargue ningún doble no es casualidad: es la prueba de que la
+mitad de simulación sigue siendo independiente del navegador. Si un día deja de
+arrancar por un `THREE` o un `document`, has cruzado la frontera.
 
 **Cambios de equilibrio: mide, no opines.** Edita `comp` y `SIZE` en
 `tests/test_drive.js` para enfrentar dos campeones concretos y usa las variables
@@ -171,14 +180,16 @@ manos humanas que en la tabla.
 2. Ajusta `hp`, `speed`, `role` (`Tirador`, `Vanguardia` o `Custodio` — el rol
    fija la distancia de combate del bot en `ROLE_RANGE`), `glyph`, `color`,
    `blurb` y `stats` (las tres barras del menú, de 1 a 5).
-3. Escribe `build(g)` con las primitivas de r128.
-4. Escribe las siete habilidades **en orden** con las primitivas de
+3. Escribe las siete habilidades **en orden** con las primitivas de
    `30_combat.js`. Cada una necesita `k`, `n`, `g` (emoji), `cd`, `wind` y `d`
    (descripción para el HUD). Si tiene versión mejorada, `exCost: 50` y `dx`
-   con su descripción.
-5. Añade el id a `CHAMP_LIST`.
-6. Añade un plan en `BOT_PLANS` de `40_ai.js`, o los bots solo usarán el básico.
-7. `node tests/sim.js` y comprueba que no aparece en la lista `sin usar:`.
+   con su descripción. Para lo que se vea o se oiga, eventos: `sfx('shot')`,
+   `fxRing(f.pos, 4.6, 0xffa35c)`.
+4. Añade su malla a `CHAMP_MESH` en `60_view.js`, con las primitivas de r128.
+5. Si usa un sonido nuevo, dale nombre en `SOUNDS` de `70_fx.js`.
+6. Añade el id a `CHAMP_LIST`.
+7. Añade un plan en `BOT_PLANS` de `40_ai.js`, o los bots solo usarán el básico.
+8. `node tests/sim.js` y comprueba que no aparece en la lista `sin usar:`.
 
 ### Una habilidad
 
@@ -213,21 +224,24 @@ nuevo es coste permanente en el sitio más caliente del código.
 
 ## 7. Deuda técnica conocida
 
-La etapa 1 del plan de red saldó cinco de las siete deudas que había aquí: paso
-fijo, azar con semilla, entrada como dato, `pos` plano y referencias por id.
-Queda esto:
+Las etapas 1 y 2 saldaron seis de las siete deudas que había aquí: paso fijo,
+azar con semilla, entrada como dato, `pos` plano, referencias por id y la
+separación entre simulación y presentación. Queda una:
 
 | Qué | Dónde | Por qué molesta |
 |---|---|---|
-| Simulación acoplada al render | `makeFighter`, `shoot`, `spawnZone` | crean mallas; un servidor no tiene escena |
-| `act()` llama a `SFX` | `20_champs.js` | los datos de habilidad dependen del audio |
-| Presentación dentro de la simulación | `dealDamage`, `killFighter`, `updateRound` | llaman a `floatNum`, `feed`, `shake`, tocan `sdRing` |
 | `G` es un singleton | `10_core.js` | un servidor necesita N partidas por proceso |
 
-Las tres primeras son la etapa 2 y se resuelven con lo mismo: que la simulación
-**emita eventos** y la vista los consuma. La cuarta se pospone a propósito — un
-proceso por partida es suficiente hasta cifras de usuarios que este proyecto no
-va a ver pronto.
+Y se pospone a propósito: un proceso (o un Worker) por partida es suficiente
+hasta cifras de usuarios que este proyecto no va a ver pronto, y además aísla
+los fallos. El refactor a `createGame(cfg)` está identificado y se hará cuando
+duela, no antes.
+
+Dos cosas que **no** son deuda aunque lo parezcan. `hitFlash`, `bob` y `anim`
+viven en el luchador aunque solo los lea la vista: son números planos, se
+serializan sin problema y un servidor que los ignore no paga nada; sacarlos
+obligaría a emitir más eventos, no menos. Y los colores (`col`, `CHAMPS.color`)
+viajan por la simulación porque son datos del kit, no decisiones de render.
 
 El plan completo está en [ONLINE.md](ONLINE.md) §4, ordenado para que cada etapa
 se pueda entregar y probar por separado.

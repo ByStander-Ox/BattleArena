@@ -1,6 +1,6 @@
-/* El comando de entrada es la frontera nueva de la etapa 1: una intención del
-   jugador convertida en dato plano. El recorrido de e2e.js no pasa por aquí
-   (sustituye playerControl por la IA), así que esta prueba lo cubre aparte.
+/* El comando de entrada es la frontera del modo online: una intención del
+   jugador convertida en dato plano. e2e.js lo atraviesa de pasada; esta prueba
+   mira los detalles que allí no se notarían.
 
    Comprueba tres cosas: que cuantizar una dirección y recuperarla no pierde
    más de un paso, que cada bit de `buttons` lanza la habilidad que le toca, y
@@ -8,12 +8,11 @@
    reconciliación del modo online dará por hecho.                            */
 const fs = require('fs'), path = require('path'), vm = require('vm');
 const root = path.join(__dirname, '..');
-const parts = ['tests/test_stub.js', 'src/10_core.js', 'src/20_champs.js',
-               'src/30_combat.js', 'src/40_ai.js'];
+const parts = ['src/10_core.js', 'src/20_champs.js', 'src/30_combat.js',
+               'src/40_ai.js', 'src/50_match.js'];
 const code = parts.map(p => fs.readFileSync(path.join(root, p), 'utf8')).join('\n');
 vm.runInThisContext(code, { filename: 'input_cmd' });
 
-scene = { add() { }, remove() { } };
 seedSim(7);
 
 let fails = 0;
@@ -45,7 +44,7 @@ function check(name, ok, detail) {
   const bits = [BTN.M1, BTN.M2, BTN.SP, BTN.Q, BTN.E, BTN.F, BTN.R];
   G.state = 'live';
   for (let i = 0; i < 7; i++) {
-    G.fighters.length = 0; G.byId.clear(); clearTransient();
+    G.fighters.length = 0; G.byId.clear(); clearTransient(); G.events.length = 0;
     const f = makeFighter('vesk', 0, false, 'prueba');
     G.fighters.push(f);
     resetFighter(f, 0, 0, 0);
@@ -61,7 +60,7 @@ function check(name, ok, detail) {
 
 /* ---- 3. movimiento y punto de apuntado ---- */
 {
-  G.fighters.length = 0; G.byId.clear(); clearTransient();
+  G.fighters.length = 0; G.byId.clear(); clearTransient(); G.events.length = 0;
   const f = makeFighter('vesk', 0, false, 'prueba');
   G.fighters.push(f);
   resetFighter(f, 3, -4, 0);        // (x, z, orientación)

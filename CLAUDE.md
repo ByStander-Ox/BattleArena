@@ -16,11 +16,11 @@ identificadores, en inglés.
 
 ```bash
 ./build.sh                  # src/ → crisol-arena.html  (obligatorio tras editar src/)
-node tests/sim.js           # 12 rondas de bots 3v3, ~300 ms; equilibrio y salud
+node tests/sim.js           # 12 rondas de bots 3v3, sin dobles, ~250 ms
 node tests/e2e.js           # recorrido completo: menú → rondas → reliquias → resultado
 node tests/determinism.js   # misma semilla ⇒ misma partida
 node tests/input_cmd.js     # el comando de entrada, de punta a punta
-node tests/lint_rng.js      # ningún Math.random en el camino de simulación
+node tests/lint.js          # azar con semilla y frontera simulación/vista
 ```
 
 `sim.js` acepta `SIM_SEED` y `SIM_ROUNDS`: con la misma semilla dos ejecuciones
@@ -32,7 +32,7 @@ No hay `package.json`, ni instalación, ni linter. Node 22 basta.
 ## Reglas que rompen el juego en silencio
 
 1. **`crisol-arena.html` es generado.** Se edita `src/`, se ejecuta `./build.sh`.
-2. **Un solo ámbito global**: los seis archivos de `src/` se concatenan en un
+2. **Un solo ámbito global**: los diez archivos de `src/` se concatenan en un
    `<script>`. Un nombre de nivel superior duplicado es un `SyntaxError` que deja
    la página en blanco. `grep -rn "nombre" src/` antes de declarar.
 3. **`'use strict'` va en la primera línea de `10_core.js`**, que es la primera
@@ -43,7 +43,10 @@ No hay `package.json`, ni instalación, ni linter. Node 22 basta.
    primero gana siempre el cuerpo a cuerpo (se midió: 58-2).
 6. **Nada de `Math.random()` en la simulación.** Usa `rnd`/`irnd`/`pickOne`/
    `chance` (con semilla) si afecta al juego, y `frand`/`frnd`/`firnd` si es
-   solo visual. Rompe el determinismo sin dar error; `tests/lint_rng.js` falla.
+   solo visual. Rompe el determinismo sin dar error; `tests/lint.js` falla.
+   Ese mismo lint impide que 10-50 toquen `THREE`, `document`, `scene` o `SFX`:
+   lo que tenga que verse u oírse sale por la cola de eventos (`emit`, `sfx`,
+   `fxRing`…) y lo consume `drainEvents()` en `70_fx.js`.
 7. **Lo que cambia el estado va en `simStep(STEP)`**, con paso fijo de 1/60.
    Lo que dibuja va en `frame()` y usa `raw`. No los mezcles.
 8. **Las entidades se señalan por `uid`, nunca por referencia** (`ownerId`,
@@ -51,15 +54,20 @@ No hay `package.json`, ni instalación, ni linter. Node 22 basta.
 
 ## Dónde está cada cosa
 
+**10-50 es simulación** (corre en Node tal cual), **60-80 es vista**, **90 une las dos.**
+
 | | |
 |---|---|
-| `src/00_head.html` | CSS, pantallas, HUD; abre el `<script>` |
-| `src/10_core.js` | utilidades, `ARENA`, `G`, `MODES`, `DIFFS`, motor, `Input`, `SFX` |
-| `src/20_champs.js` | `CHAMPS` (stats + mallas + 7 habilidades), `RELICS` |
-| `src/30_combat.js` | entidades, `dealDamage`, `applyCC`, `tickFighter`, primitivas |
+| `src/10_core.js` | utilidades, azar con semilla, `ARENA`, `G`, eventos, comando de entrada |
+| `src/20_champs.js` | `CHAMPS` (stats + 7 habilidades), `RELICS` |
+| `src/30_combat.js` | entidades, `dealDamage`, `applyCC`, `tickFighter`, primitivas, `applyInput` |
 | `src/40_ai.js` | `updateAI`, `BOT_PLANS`, `ROLE_RANGE` |
-| `src/50_match_ui.js` | máquina de partida, rondas, reliquias, HUD |
-| `src/60_loop.js` | `playerControl`, `updateRound`, `frame`, `boot` |
+| `src/50_match.js` | máquina de partida, rondas, reliquias, **`simStep(dt, cmd)`** |
+| `src/00_head.html` | CSS, pantallas, HUD; abre el `<script>` |
+| `src/60_view.js` | three.js, escena, cámara, `CHAMP_MESH`, **`syncView`** |
+| `src/70_fx.js` | partículas, `SOUNDS`, `SFX`, **`drainEvents`** |
+| `src/80_ui.js` | HUD, placas, pantallas, `uiEvent`, `Input`, `sampleInput` |
+| `src/90_loop.js` | `frame`, `boot` |
 
 ## Antes de terminar una tarea
 
@@ -67,9 +75,13 @@ Los cinco tests pasan. Para cambios de equilibrio, mide con `tests/sim.js`
 (edita `comp` y `SIZE` en `tests/test_drive.js`, fija `SIM_SEED` y sube a 40-60
 rondas); doce rondas son ruido.
 
-`tests/test_drive.js` reproduce a mano el bucle de `simStep`, porque no carga la
-capa de partida ni la interfaz. Si cambias el orden de `simStep`, cámbialo
-también allí.
+Que `tests/sim.js` arranque sin dobles es la señal de que la mitad de simulación
+sigue siendo independiente del navegador. Si deja de arrancar, has cruzado la
+frontera.
+
+`tests/test_drive.js` reproduce a mano el bucle de `simStep` porque lleva su
+propio ritmo de ronda, sin menús ni reliquias. Si cambias el orden de `simStep`,
+cámbialo también allí.
 
 ## Documentación
 

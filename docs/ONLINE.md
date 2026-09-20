@@ -5,9 +5,10 @@ jugador contra bots, todo en una pestaña. Este documento decide **qué modelo d
 red usar**, audita **qué del código actual lo impide** y propone **un plan por
 etapas** en el que cada paso se puede entregar y probar por separado.
 
-**Estado: etapa 1 hecha.** La simulación ya es determinista y la entrada ya
-es un dato. Falta todo lo demás — no hay servidor, ni socket, ni una sola línea
-de red. Cada apartado dice en qué punto está.
+**Estado: etapas 1 y 2 hechas.** La simulación es determinista, la entrada es
+un dato y el código de juego ya no depende de three.js, del DOM ni del audio:
+corre entero en Node. Falta la red — no hay servidor, ni socket, ni una sola
+línea de protocolo. Cada apartado dice en qué punto está.
 
 ---
 
@@ -115,20 +116,20 @@ Es la etapa 2 del plan y ahorra muchísimo tiempo.
 
 ## 3. Auditoría: qué impide hoy el online
 
-Siete obstáculos concretos. Cinco están resueltos (etapa 1); quedan dos, los
-que más código tocan.
+Siete obstáculos concretos. Seis están resueltos; el que queda se pospone a
+propósito.
 
 | | Obstáculo | Estado |
 |---|---|---|
 | 3.1 | paso de tiempo variable | **hecho** |
 | 3.2 | aleatoriedad sin semilla | **hecho** |
-| 3.3 | la simulación crea mallas | pendiente (etapa 2) |
+| 3.3 | la simulación crea mallas | **hecho** |
 | 3.4 | `pos` es un `THREE.Vector3` | **hecho** |
 | 3.5 | referencias cruzadas entre entidades | **hecho** |
 | 3.6 | `G` es un singleton | pendiente (se pospone a propósito) |
 | 3.7 | la entrada se lee dentro de la simulación | **hecho** |
 
-### 3.1 Paso de tiempo variable — `60_loop.js` · **hecho**
+### 3.1 Paso de tiempo variable — el bucle · **hecho**
 
 ```js
 const raw = Math.min(.05, clock.getDelta());
@@ -198,14 +199,14 @@ si aparece `Math.random` fuera de las funciones de efectos.
 Implementado con dos juegos de ayudantes en `10_core.js`: `rnd`, `irnd`,
 `pickOne` y `chance` tiran de `srand()`; `frnd`, `firnd` y `frand` son los
 cosméticos. `Math.random` solo aparece ya en las tres líneas que definen los
-cosméticos, y **`node tests/lint_rng.js` falla si reaparece en cualquier otro
+cosméticos, y **`node tests/lint.js` falla si reaparece en cualquier otro
 sitio** — que era justo la comprobación que este documento prometía.
 
 Beneficio colateral, ya disponible: `tests/sim.js` acepta `SIM_SEED` y es
 reproducible, así que un cambio de equilibrio se mide contra exactamente la
 misma secuencia de partidas. `startMatch(seed)` guarda la semilla en `G.seed`.
 
-### 3.3 La simulación crea mallas — `30_combat.js`, `20_champs.js` · pendiente
+### 3.3 La simulación crea mallas — `30_combat.js`, `20_champs.js` · **hecho**
 
 `makeFighter` monta un `THREE.Group`, `shoot` crea una `SphereGeometry`,
 `spawnZone` crea dos mallas y las añade a `scene`. El servidor no tiene escena.
@@ -228,8 +229,31 @@ G.events.length = 0;
 La misma cola viaja por la red: el cliente remoto reproduce los efectos de lo que
 hicieron los demás sin haberlo simulado.
 
-Lo mismo con el sonido: `SFX.shot()` dentro de `act()` pasa a ser un evento. Es
-el cambio que más archivos toca, pero es mecánico.
+Lo mismo con el sonido: `SFX.shot()` dentro de `act()` pasa a ser un evento.
+
+Implementado, con una diferencia respecto al esbozo que resultó ser importante:
+**las entidades no se anuncian por eventos, se reconcilian.** Los eventos sirven
+para lo instantáneo (un impacto, un grito, una muerte, un aviso); para lo que
+persiste —luchadores, proyectiles, zonas, orbes— la vista recorre las listas de
+`G` cada fotograma, crea la malla de lo que no la tiene y destruye la de lo que
+ya no está (`syncView`, en `60_view.js`).
+
+Sale más corto que emitir un evento por cada nacimiento y cada muerte, no se
+rompe si un evento se pierde, y es exactamente lo que tendrá que hacer un
+cliente al recibir instantáneas por la red: comparar lo que le llega con lo que
+tiene dibujado. Un protocolo que dependiera de eventos de creación obligaría a
+entrega fiable y ordenada; así no.
+
+El proyecto quedó partido en dos mitades visibles desde el nombre del archivo:
+
+```
+src/10_core.js   20_champs.js   30_combat.js   40_ai.js   50_match.js    ← simulación
+src/60_view.js   70_fx.js       80_ui.js                                 ← vista
+src/90_loop.js                                                           ← el bucle que las une
+```
+
+`tests/lint.js` falla si algo de 10-50 menciona `THREE`, `document`, `window`,
+`scene`, `renderer`, `camera` o `SFX`.
 
 ### 3.4 `pos` es un `THREE.Vector3` · **hecho**
 
@@ -265,7 +289,7 @@ pronto. Recomendación: **empezar por el atajo**, medir, y hacer el refactor sol
 si el coste de memoria aparece de verdad. Un proceso por partida además aísla
 los fallos: una partida que revienta no se lleva las demás.
 
-### 3.7 La entrada se lee desde dentro de la simulación — `60_loop.js` · **hecho**
+### 3.7 La entrada se lee desde dentro de la simulación — el bucle · **hecho**
 
 ```js
 if (Input.m1 || (Input.touch && Input.tFire)) tryCast(f, 0, false);
@@ -351,7 +375,7 @@ reliquias desiguales a propósito para ejercitar los modificadores.
 
 Dos cosas que la etapa trajo de propina:
 
-- `tests/lint_rng.js` impide que vuelva a colarse un `Math.random()` en el camino
+- `tests/lint.js` impide que vuelva a colarse un `Math.random()` en el camino
   de simulación. Es la comprobación automática que §3.2 prometía.
 - Con semilla, `tests/sim.js` es reproducible: `SIM_SEED` y `SIM_ROUNDS` hacen
   que un ajuste de equilibrio se pueda medir contra la misma secuencia exacta de
@@ -386,7 +410,7 @@ juego se siente como en local.
 Node + `ws`. Gestor de salas, un Worker o proceso por partida. Emparejamiento
 mínimo: una cola por modo, se llena, se crea la sala. Máquina de estados de
 partida en el servidor (las rondas y las reliquias ya están escritas en
-`50_match_ui.js`; se mueven casi tal cual). Reconexión con un bot cubriendo el
+`50_match.js`, ya sin interfaz). Reconexión con un bot cubriendo el
 hueco.
 
 ### Etapa 5 — Producción

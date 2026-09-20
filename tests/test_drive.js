@@ -1,15 +1,17 @@
 /* ---- simulación sin render ----
 
-   Reproduce a mano el bucle de simStep() (60_loop.js), porque este banco de
-   pruebas no carga la capa de partida ni la interfaz: lleva su propio ritmo de
-   ronda. Si tocas el orden de simStep, tócalo también aquí o las dos cosas
-   medirán cosas distintas.
+   Reproduce a mano el bucle de simStep() (50_match.js) porque lleva su propio
+   ritmo de ronda, sin menús ni reliquias por ronda. Si tocas el orden de
+   simStep, tócalo también aquí o las dos cosas medirán cosas distintas.
+
+   No carga ningún doble de three.js ni del DOM: desde la etapa 2 la mitad de
+   simulación no los necesita. Ese es justamente el criterio de aceptación.
 
    Parámetros por variable de entorno:
      SIM_SEED=123   semilla (misma semilla = misma partida, paso a paso)
      SIM_ROUNDS=60  rondas a simular (12 es ruido; 40-60 ya es señal)          */
 
-scene = { add() { }, remove() { } };
+
 
 const env = (typeof process !== 'undefined' && process.env) || {};
 const SEED = typeof SIM_SEED === 'number' ? SIM_SEED : Number(env.SIM_SEED || 20260919);
@@ -27,13 +29,6 @@ tryCast = function (f, i, ex) {
   }
   return ok;
 };
-
-function spawnPoints(team, n) {
-  const x = team === 0 ? -14.5 : 14.5;
-  const out = [];
-  for (let i = 0; i < n; i++) out.push({ x, z: (i - (n - 1) / 2) * 3.4, a: team === 0 ? Math.PI / 2 : -Math.PI / 2 });
-  return out;
-}
 
 const SIZE = 3;
 G.mode = MODES.squad; G.wins = 3; G.playerTeam = 0; G.roundLimit = 110; G.diff = 'hard';
@@ -82,7 +77,7 @@ for (let step = 0; step < budget; step++) {
   updateProjectiles(STEP);
   updateZones(STEP);
   updatePickups(STEP);
-  updateFx(STEP);
+  G.events.length = 0;      // nadie los consume aquí: no hay vista
   for (const f of G.fighters) {
     f.velEst.x = (f.pos.x - f.px) / STEP;
     f.velEst.z = (f.pos.z - f.pz) / STEP;
@@ -119,7 +114,7 @@ function fingerprint() {
 if (!QUIET) {
   console.log('semilla:', SEED, '· rondas simuladas:', rounds, '· marcador', wins.join('-'), '· ms', Date.now() - t0);
   console.log('daño total:', Math.round(totalDmg), '· curación:', Math.round(G.fighters.reduce((a, f) => a + f.stats.heal, 0)));
-  console.log('proyectiles vivos:', G.projectiles.length, '· zonas:', G.zones.length, '· fx:', G.fx.length, '· orbes:', G.pickups.length);
+  console.log('proyectiles vivos:', G.projectiles.length, '· zonas:', G.zones.length, '· orbes:', G.pickups.length);
   const used = Object.keys(castCount).sort();
   console.log('habilidades usadas (' + used.length + '):');
   for (const k of used) console.log('   ', k, castCount[k]);

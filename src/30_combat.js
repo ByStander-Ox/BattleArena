@@ -1,6 +1,9 @@
 /* ============================ luchadores ============================ */
+/* Simulación pura: sin three.js, sin DOM, sin audio. Todo lo que habría que
+   dibujar o sonar sale por la cola de eventos de 10_core.js. Este archivo,
+   junto con 10, 20, 40 y 50, es lo que correría un servidor autoritativo tal
+   cual — y lo que `node tests/sim.js` ejecuta sin ningún doble.            */
 let _uid = 0;
-const TEAM_COL = [0x4a9ef0, 0xe8574c];
 const BOT_NAMES = [['Kael', 'Nera', 'Orin', 'Sila'], ['Drax', 'Vora', 'Tarn', 'Mire']];
 
 function makeFighter(champId, team, isBot, name) {
@@ -19,25 +22,10 @@ function makeFighter(champId, team, isBot, name) {
       startEnergy: 0, ultCost: 0, dashHaste: false, dashShield: 0, lowHpDr: 0, mark: 0, autoShield: 0, echo: 0
     },
     relics: [], stats: { dmg: 0, heal: 0, taken: 0, kills: 0, rounds: 0 },
-    ai: null, mesh: null, plate: null, hitFlash: 0, bob: 0, anim: 0
+    ai: null,
+    // estado de animación: números planos que la vista lee y el servidor ignora
+    hitFlash: 0, bob: 0, anim: 0
   };
-  const g = new THREE.Group();
-  const ringGeo = new THREE.RingGeometry(.58, .8, 26);
-  ringGeo.rotateX(-Math.PI / 2);
-  const ring = new THREE.Mesh(ringGeo, new THREE.MeshBasicMaterial({ color: TEAM_COL[team], transparent: true, opacity: .8, side: THREE.DoubleSide, depthWrite: false }));
-  ring.position.y = .04;
-  g.add(ring);
-  const body = new THREE.Group();
-  C.build(body);
-  g.add(body);
-  const nose = new THREE.Mesh(new THREE.ConeGeometry(.15, .38, 6), new THREE.MeshBasicMaterial({ color: TEAM_COL[team] }));
-  nose.rotation.x = Math.PI / 2; nose.position.set(0, .92, .58);
-  g.add(nose);
-  // tinte de equipo en el material principal
-  body.traverse(o => { if (o.isMesh) { o.material = o.material.clone(); o.castShadow = true; } });
-  g.userData = { body, ring, base: body.scale.x || 1 };
-  f.mesh = g;
-  scene.add(g);
   G.byId.set(f.uid, f);
   return f;
 }
@@ -61,10 +49,6 @@ function resetFighter(f, x, z, faceDir) {
   f.px = x; f.pz = z; f.pface = faceDir;
   f.velEst.x = 0; f.velEst.z = 0;
   f.face = faceDir; f.aimDir.x = Math.sin(faceDir); f.aimDir.z = Math.cos(faceDir);
-  f.mesh.visible = true;
-  f.mesh.position.set(x, 0, z);
-  f.mesh.rotation.set(0, faceDir, 0);
-  f.mesh.scale.setScalar(1);
   if (f.mods.autoShield) f.st.autoT = f.mods.autoShield;
   if (f.ai) {                       // que los bots no reaccionen todos en el mismo fotograma
     f.ai.hold = rnd(.1, .8); f.ai.think = rnd(0, .3); f.ai.tgtId = 0;
@@ -107,8 +91,7 @@ function dealDamage(src, tgt, amount, opts) {
     }
   }
   gainEnergy(tgt, dmg * .16);
-  floatNum(tgt.pos, Math.round(dmg), dmg >= 18 ? 'crit' : 'dmg');
-  if (tgt === G.player || src === G.player) SFX.hit();
+  emit({ e: 'dmg', id: tgt.uid, byId: src ? src.uid : 0, dmg, x: tgt.pos.x, z: tgt.pos.z });
   if (tgt.hp <= 0) killFighter(tgt, src);
   return dmg;
 }
@@ -122,7 +105,7 @@ function healTarget(src, tgt, amount, silent) {
     if (src !== tgt) src.stats.heal += h;
     gainEnergy(src, h * .3);
   }
-  if (!silent) floatNum(tgt.pos, '+' + h, 'heal');
+  if (!silent) emit({ e: 'heal', id: tgt.uid, amount: h, x: tgt.pos.x, z: tgt.pos.z });
   return h;
 }
 
@@ -141,12 +124,10 @@ function applyCC(f, type, t) {
     e.n++; e.t = 6.5;
   }
   t *= 1 - f.mods.tenacity;
-  if (t <= .08) { floatNum(f.pos, 'Inmune', 'en'); return; }
+  if (t <= .08) { emit({ e: 'cc', id: f.uid, type: 'immune', x: f.pos.x, z: f.pos.z }); return; }
   f.st[type] = Math.max(f.st[type] || 0, t);
   if (type === 'stun' && f.casting) cancelCast(f);
-  if (type === 'stun') floatNum(f.pos, 'Aturdido', 'en');
-  else if (type === 'root') floatNum(f.pos, 'Raíz', 'en');
-  else if (type === 'silence') floatNum(f.pos, 'Silencio', 'en');
+  emit({ e: 'cc', id: f.uid, type, x: f.pos.x, z: f.pos.z });
 }
 
 function applySlow(f, amt, t) {
@@ -169,42 +150,33 @@ function killFighter(f, src) {
   if (!f.alive) return;
   f.alive = false; f.hp = 0; f.shield = 0; f.deadT = 0;
   f.dash = null; f.casting = null;
-  puff(f.pos, TEAM_COL[f.team], 26);
-  SFX.die();
   if (src && src !== f) src.stats.kills++;
   const who = src && src !== f ? src : null;
-  if (!G.firstBlood && who) { G.firstBlood = true; feed(`<b class="${who.team ? 'b' : 'a'}">${who.name}</b> abre el marcador`); }
-  feed(who ? `<b class="${who.team ? 'b' : 'a'}">${who.name}</b> elimina a <b class="${f.team ? 'b' : 'a'}">${f.name}</b>`
-    : `<b class="${f.team ? 'b' : 'a'}">${f.name}</b> cae al vacío`);
-  if (f === G.player) shake(.7);
+  const first = !G.firstBlood && !!who;
+  if (first) G.firstBlood = true;
+  emit({ e: 'kill', id: f.uid, byId: who ? who.uid : 0, first });
 }
 
 /* ============================ primitivas de habilidad ============================ */
 function shoot(f, o) {
   const d = o.dir, len = Math.hypot(d.x, d.z) || 1;
-  const col = o.color || 0xffffff;
-  const scale = o.scale || 1;
-  const geo = o.flat ? new THREE.BoxGeometry(o.radius * 2.2, .3, .7) : new THREE.SphereGeometry(Math.max(.18, o.radius * .8), 10, 8);
-  const mesh = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ color: col }));
-  if (!o.flat) mesh.scale.set(1, 1, scale * 1.7);
-  mesh.position.set(f.pos.x + d.x / len * .7, 1.0, f.pos.z + d.z / len * .7);
-  mesh.rotation.y = Math.atan2(d.x, d.z);
-  scene.add(mesh);
-  const light = null;
+  const x = f.pos.x + d.x / len * .7, z = f.pos.z + d.z / len * .7;
   G.projectiles.push({
-    x: mesh.position.x, z: mesh.position.z, px: mesh.position.x, pz: mesh.position.z,
+    id: ++_uid, x, z, px: x, pz: z,
     dx: d.x / len, dz: d.z / len,
     speed: o.speed, radius: o.radius, range: o.range, traveled: 0,
     dmg: o.dmg || 0, healAlly: o.healAlly || 0, kb: o.kb || 0, pull: o.pull || 0,
     cc: o.cc, ccT: o.ccT || 0, cc2: o.cc2, cc2T: o.cc2T || 0,
-    pierce: !!o.pierce, chain: !!o.chain, team: f.team, ownerId: f.uid, hit: [], mesh, light, alive: true, col
+    pierce: !!o.pierce, chain: !!o.chain, team: f.team, ownerId: f.uid, hit: [], alive: true,
+    // aspecto: lo lee la vista para construir la malla, no afecta a la física
+    col: o.color || 0xffffff, scale: o.scale || 1, flat: !!o.flat
   });
 }
 
 function meleeArc(f, o) {
   const a0 = Math.atan2(o.dir.x, o.dir.z);
   const half = (o.arc || 90) * Math.PI / 360;
-  arcFx(f.pos, a0, half, o.range, o.color || 0xffffff);
+  fxArc(f.pos, a0, half, o.range, o.color || 0xffffff);
   let hit = 0;
   for (const t of G.fighters) {
     if (t.team === f.team || !t.alive) continue;
@@ -223,7 +195,7 @@ function meleeArc(f, o) {
 function coneHeal(f, o) {
   const a0 = Math.atan2(o.dir.x, o.dir.z);
   const half = (o.arc || 70) * Math.PI / 360;
-  arcFx(f.pos, a0, half, o.range, 0x8ff0bb);
+  fxArc(f.pos, a0, half, o.range, 0x8ff0bb);
   if (o.selfHeal) healTarget(f, f, o.selfHeal);
   if (o.cleanse) cleanse(f);
   for (const t of G.fighters) {
@@ -261,22 +233,12 @@ function startDash(f, o) {
 }
 
 function spawnZone(f, o) {
-  const col = o.color || 0xffffff;
-  const geo = new THREE.CircleGeometry(o.radius, 40);
-  geo.rotateX(-Math.PI / 2);
-  const mesh = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ color: col, transparent: true, opacity: .16, depthWrite: false }));
-  mesh.position.set(o.x, .06, o.z);
-  scene.add(mesh);
-  const rg = new THREE.RingGeometry(o.radius * .96, o.radius, 44);
-  rg.rotateX(-Math.PI / 2);
-  const ring = new THREE.Mesh(rg, new THREE.MeshBasicMaterial({ color: col, transparent: true, opacity: .6, depthWrite: false }));
-  ring.position.copy(mesh.position);
-  scene.add(ring);
   G.zones.push({
-    x: o.x, z: o.z, radius: o.radius, dur: o.dur, t: 0, delay: o.delay || 0,
+    id: ++_uid, x: o.x, z: o.z, radius: o.radius, dur: o.dur, t: 0, delay: o.delay || 0,
     tick: o.tick || 0, tickT: 0, tickDmg: o.tickDmg || 0, tickHeal: o.tickHeal || 0,
     dmg: o.dmg || 0, cc: o.cc, ccT: o.ccT || 0, slow: o.slow || 0, trap: !!o.trap,
-    friendly: !!o.friendly, rain: !!o.rain, team: f.team, ownerId: f.uid, mesh, ring, alive: true, col
+    friendly: !!o.friendly, rain: !!o.rain, team: f.team, ownerId: f.uid, alive: true,
+    col: o.color || 0xffffff
   });
 }
 
@@ -401,21 +363,13 @@ function tickFighter(f, dt) {
   for (let i = 0; i < f.cds.length; i++) if (f.cds[i] > 0) f.cds[i] = Math.max(0, f.cds[i] - dt);
   if (f.mods.autoShield) {
     st.autoT -= dt;
-    if (st.autoT <= 0) { st.autoT = f.mods.autoShield; addShield(f, 26, 6); ringFx(f.pos, 1.1, 0xbfe0ff); }
+    if (st.autoT <= 0) { st.autoT = f.mods.autoShield; addShield(f, 26, 6); fxRing(f.pos, 1.1, 0xbfe0ff); }
   }
 
-  if (!f.alive) {
-    f.deadT += dt;
-    f.mesh.rotation.x = Math.min(Math.PI / 2, f.deadT * 4);
-    f.mesh.position.y = Math.max(-1.2, -f.deadT * .6);
-    if (f.deadT > 1.4) f.mesh.visible = false;
-    return;
-  }
+  if (!f.alive) { f.deadT += dt; return; }     // la vista deriva la caída de deadT
   if (f.falling > 0) {
     f.falling += dt;
-    f.mesh.position.y -= dt * 14;
-    f.mesh.rotation.z += dt * 3;
-    if (f.falling > .55) { killFighter(f, fighterById(f.lastHitById)); f.mesh.visible = false; }
+    if (f.falling > .55) killFighter(f, fighterById(f.lastHitById));
     return;
   }
 
@@ -443,7 +397,6 @@ function tickFighter(f, dt) {
     f.pos.x += d.dx * step; f.pos.z += d.dz * step;
     if (collidePillars(f.pos, .5)) d.t = d.dur;
     pushInside(f.pos, .5);
-    if (d.trail && frand() < .5) puff(f.pos, d.trail, 2, .5);   // estela: presentación
     if (d.dmg || d.cc) {
       for (const t of G.fighters) {
         if (t.team === f.team || !t.alive || d.hit.indexOf(t.uid) >= 0) continue;
@@ -491,34 +444,6 @@ function tickFighter(f, dt) {
   }
 }
 
-/* La simulación avanza a saltos fijos de 1/60 s; `alpha` dice qué fracción del
-   siguiente paso lleva acumulada el fotograma actual. Interpolar entre la
-   posición anterior y la nueva es lo que mantiene el movimiento suave también
-   a 120 o 144 Hz, donde un paso fijo sin interpolar se vería a tirones. */
-function updateFighterVisual(f, alpha) {
-  if (!f.alive || f.falling) return;
-  const m = f.mesh;
-  m.position.x = lerp(f.px, f.pos.x, alpha);
-  m.position.z = lerp(f.pz, f.pos.z, alpha);
-  m.position.y = Math.abs(Math.sin(f.bob)) * .06 + (f.anim > 0 ? .1 : 0);
-  m.rotation.y = f.pface + angDiff(f.face, f.pface) * alpha;
-  const b = m.userData.body;
-  const base = m.userData.base;
-  const pulse = f.anim > 0 ? 1 + f.anim * .5 : 1;
-  b.scale.setScalar(base * pulse);
-  b.rotation.z = Math.sin(f.bob) * .05;
-  // parpadeo al recibir daño / estado
-  const flash = f.hitFlash > 0;
-  b.traverse(o => {
-    if (!o.isMesh || !o.material.emissive) return;
-    if (flash) o.material.emissive.setHex(0x883322);
-    else if (f.st.stun > 0) o.material.emissive.setHex(0x554400);
-    else if (f.shield > 0) o.material.emissive.setHex(0x223355);
-    else o.material.emissive.setHex(0x000000);
-  });
-  m.userData.ring.material.opacity = f.st.invuln > 0 ? .3 : .8;
-}
-
 /* ============================ proyectiles ============================ */
 function updateProjectiles(dt) {
   for (let i = G.projectiles.length - 1; i >= 0; i--) {
@@ -541,7 +466,7 @@ function updateProjectiles(dt) {
       if (friendly) {
         healTarget(owner, t, p.healAlly);
       } else {
-        if (t.st.evade > 0) { t.st.evade = 0; floatNum(t.pos, 'Evadido', 'en'); continue; }
+        if (t.st.evade > 0) { t.st.evade = 0; emit({ e: 'evade', id: t.uid, x: t.pos.x, z: t.pos.z }); continue; }
         dealDamage(owner, t, p.dmg);
         t.lastHitById = p.ownerId;
         if (p.cc) applyCC(t, p.cc, p.ccT);
@@ -551,19 +476,14 @@ function updateProjectiles(dt) {
           applyKnockback(t, dx, dz, Math.max(0, Math.hypot(dx, dz) - 2) * 4.2);
         } else if (p.kb) applyKnockback(t, p.dx, p.dz, p.kb);
       }
-      hitFx(p.x, p.z, p.col);
+      fxHit(p.x, p.z, p.col);
       if (!p.pierce) { consumed = true; break; }
     }
     if (consumed) destroyProj(p, i, true);
   }
 }
-function updateProjectileVisual(alpha) {
-  for (const p of G.projectiles) p.mesh.position.set(lerp(p.px, p.x, alpha), 1.0, lerp(p.pz, p.z, alpha));
-}
 function destroyProj(p, i, fx) {
-  if (fx) hitFx(p.x, p.z, p.col);
-  scene.remove(p.mesh);
-  p.mesh.geometry.dispose(); p.mesh.material.dispose();
+  if (fx) fxHit(p.x, p.z, p.col);
   G.projectiles.splice(i, 1);
 }
 
@@ -571,18 +491,8 @@ function destroyProj(p, i, fx) {
 function updateZones(dt) {
   for (let i = G.zones.length - 1; i >= 0; i--) {
     const z = G.zones[i];
-    if (z.delay > 0) {
-      z.delay -= dt;
-      z.mesh.material.opacity = .05 + Math.abs(Math.sin(G.t * 9)) * .12;
-      continue;
-    }
+    if (z.delay > 0) { z.delay -= dt; continue; }
     z.t += dt;
-    z.ring.rotation.y += dt * .6;
-    z.mesh.material.opacity = .13 + Math.sin(G.t * 3) * .03;
-    if (z.rain && frand() < dt * 40) {                // solo lluvia visible
-      const a = frand() * TAU, r = Math.sqrt(frand()) * z.radius;
-      rainFx(z.x + Math.cos(a) * r, z.z + Math.sin(a) * r, z.col);
-    }
     const owner = fighterById(z.ownerId);
     if (z.trap) {
       for (const t of G.fighters) {
@@ -590,7 +500,7 @@ function updateZones(dt) {
         if (dist(t.pos.x, t.pos.z, z.x, z.z) > z.radius) continue;
         dealDamage(owner, t, z.dmg);
         applyCC(t, z.cc, z.ccT);
-        ringFx({ x: z.x, y: 0, z: z.z }, z.radius, z.col);
+        fxRing({ x: z.x, z: z.z }, z.radius, z.col);
         z.t = z.dur + 1;
         break;
       }
@@ -615,131 +525,37 @@ function updateZones(dt) {
         }
       }
     }
-    if (z.t >= z.dur) {
-      scene.remove(z.mesh); scene.remove(z.ring);
-      z.mesh.geometry.dispose(); z.mesh.material.dispose();
-      z.ring.geometry.dispose(); z.ring.material.dispose();
-      G.zones.splice(i, 1);
-    }
+    if (z.t >= z.dur) G.zones.splice(i, 1);
   }
 }
 
 /* ============================ orbes ============================ */
 function spawnPickup(type, x, z) {
-  const c = type === 'energy' ? 0xffcf5a : 0x5fd39a;
-  const m = new THREE.Mesh(new THREE.OctahedronGeometry(.5, 0), new THREE.MeshStandardMaterial({ color: c, emissive: c, emissiveIntensity: .7, roughness: .3 }));
-  m.position.set(x, 1.1, z);
-  m.castShadow = true;
-  scene.add(m);
-  const halo = new THREE.Mesh(new THREE.RingGeometry(.7, .95, 24).rotateX(-Math.PI / 2), new THREE.MeshBasicMaterial({ color: c, transparent: true, opacity: .5, depthWrite: false }));
-  halo.position.set(x, .08, z);
-  scene.add(halo);
-  G.pickups.push({ type, x, z, mesh: m, halo, t: 0 });
+  G.pickups.push({ id: ++_uid, type, x, z, t: 0 });
 }
 function updatePickups(dt) {
   for (let i = G.pickups.length - 1; i >= 0; i--) {
     const p = G.pickups[i];
     p.t += dt;
-    p.mesh.rotation.y += dt * 1.8;
-    p.mesh.position.y = 1.1 + Math.sin(p.t * 2.4) * .18;
-    p.halo.scale.setScalar(1 + Math.sin(p.t * 2.4) * .08);
     for (const f of G.fighters) {
       if (!f.alive || dist(f.pos.x, f.pos.z, p.x, p.z) > 1.25) continue;
       if (p.type === 'energy') {
         gainEnergy(f, 38);
         for (const a of G.fighters) if (a.team === f.team && a !== f && a.alive) gainEnergy(a, 16);
-        floatNum(f.pos, '+38 energía', 'en');
       } else {
         healTarget(null, f, 30);
       }
-      SFX.orb();
-      scene.remove(p.mesh); scene.remove(p.halo);
+      emit({ e: 'orb', id: p.id, kind: p.type, byId: f.uid, x: p.x, z: p.z });
       G.pickups.splice(i, 1);
       break;
     }
   }
 }
-function clearPickups() {
-  for (const p of G.pickups) { scene.remove(p.mesh); scene.remove(p.halo); }
-  G.pickups.length = 0;
-}
+function clearPickups() { G.pickups.length = 0; }
 
-/* ============================ efectos ============================ */
-function puff(pos, col, n, scale) {
-  for (let i = 0; i < n; i++) {
-    const m = new THREE.Mesh(new THREE.SphereGeometry((scale || 1) * frnd(.08, .2), 6, 5), new THREE.MeshBasicMaterial({ color: col, transparent: true, opacity: .9 }));
-    m.position.set(pos.x + frnd(-.4, .4), (pos.y || 0) + frnd(.3, 1.5), pos.z + frnd(-.4, .4));
-    scene.add(m);
-    G.fx.push({ mesh: m, t: 0, dur: frnd(.3, .7), vy: frnd(1, 4), vx: frnd(-2.5, 2.5), vz: frnd(-2.5, 2.5), kind: 'puff' });
-  }
-}
-function hitFx(x, z, col) {
-  const m = new THREE.Mesh(new THREE.SphereGeometry(.34, 8, 6), new THREE.MeshBasicMaterial({ color: col, transparent: true, opacity: .9 }));
-  m.position.set(x, 1.0, z);
-  scene.add(m);
-  G.fx.push({ mesh: m, t: 0, dur: .2, kind: 'pop' });
-}
-function ringFx(pos, radius, col) {
-  const g = new THREE.RingGeometry(radius * .82, radius, 48);
-  g.rotateX(-Math.PI / 2);
-  const m = new THREE.Mesh(g, new THREE.MeshBasicMaterial({ color: col, transparent: true, opacity: .85, depthWrite: false, side: THREE.DoubleSide }));
-  m.position.set(pos.x, .12, pos.z);
-  m.scale.setScalar(.25);
-  scene.add(m);
-  G.fx.push({ mesh: m, t: 0, dur: .45, kind: 'ring' });
-}
-function arcFx(pos, a0, half, range, col) {
-  const shape = new THREE.Shape();
-  shape.moveTo(0, 0);
-  shape.absarc(0, 0, range, -half + Math.PI / 2, half + Math.PI / 2, false);
-  shape.lineTo(0, 0);
-  const g = new THREE.ShapeGeometry(shape, 12);
-  g.rotateX(-Math.PI / 2);
-  const m = new THREE.Mesh(g, new THREE.MeshBasicMaterial({ color: col, transparent: true, opacity: .45, side: THREE.DoubleSide, depthWrite: false }));
-  m.position.set(pos.x, .14, pos.z);
-  m.rotation.y = a0 + Math.PI;
-  scene.add(m);
-  G.fx.push({ mesh: m, t: 0, dur: .22, kind: 'fade' });
-}
-function rainFx(x, z, col) {
-  const m = new THREE.Mesh(new THREE.CylinderGeometry(.04, .04, 1.1, 4), new THREE.MeshBasicMaterial({ color: col }));
-  m.position.set(x, 7, z);
-  scene.add(m);
-  G.fx.push({ mesh: m, t: 0, dur: .5, vy: -18, kind: 'fall' });
-}
-function updateFx(dt) {
-  for (let i = G.fx.length - 1; i >= 0; i--) {
-    const e = G.fx[i];
-    e.t += dt;
-    const k = e.t / e.dur;
-    if (e.kind === 'puff') {
-      e.mesh.position.x += e.vx * dt; e.mesh.position.z += e.vz * dt;
-      e.mesh.position.y += (e.vy - k * 6) * dt;
-      e.mesh.material.opacity = .9 * (1 - k);
-    } else if (e.kind === 'pop') {
-      e.mesh.scale.setScalar(1 + k * 2.2);
-      e.mesh.material.opacity = .9 * (1 - k);
-    } else if (e.kind === 'ring') {
-      e.mesh.scale.setScalar(.25 + k * .85);
-      e.mesh.material.opacity = .85 * (1 - k);
-    } else if (e.kind === 'fade') {
-      e.mesh.material.opacity = .45 * (1 - k);
-    } else if (e.kind === 'fall') {
-      e.mesh.position.y += e.vy * dt;
-      if (e.mesh.position.y < .2) e.t = e.dur;
-    }
-    if (e.t >= e.dur) {
-      scene.remove(e.mesh);
-      e.mesh.geometry.dispose(); e.mesh.material.dispose();
-      G.fx.splice(i, 1);
-    }
-  }
-}
 function clearTransient() {
-  for (let i = G.projectiles.length - 1; i >= 0; i--) destroyProj(G.projectiles[i], i, false);
-  for (const z of G.zones) { scene.remove(z.mesh); scene.remove(z.ring); }
+  G.projectiles.length = 0;
   G.zones.length = 0;
-  for (const e of G.fx) scene.remove(e.mesh);
-  G.fx.length = 0;
   clearPickups();
+  emit({ e: 'clearFx' });      // que la vista tire también sus partículas
 }

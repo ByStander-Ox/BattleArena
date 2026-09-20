@@ -12,8 +12,8 @@
    de algo externo.                                                          */
 const fs = require('fs'), path = require('path'), vm = require('vm');
 const root = path.join(__dirname, '..');
-const parts = ['tests/test_stub.js', 'src/10_core.js', 'src/20_champs.js',
-               'src/30_combat.js', 'src/40_ai.js', 'tests/test_drive.js'];
+const parts = ['src/10_core.js', 'src/20_champs.js', 'src/30_combat.js',
+               'src/40_ai.js', 'src/50_match.js', 'tests/test_drive.js'];
 const code = parts.map(p => fs.readFileSync(path.join(root, p), 'utf8')).join('\n');
 
 function run(seed) {

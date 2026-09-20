@@ -10,14 +10,22 @@ dos tipografías de Google Fonts.
 ```
 crisol-arena.html      juego completo, listo para abrir con doble clic
 build.sh               reconstruye crisol-arena.html a partir de src/
-src/                   el código separado por módulos (es lo que conviene editar)
-  00_head.html         <head>, CSS y maquetación de pantallas y HUD
-  10_core.js           estado global, render, arena, cámara, entrada, sonido
+src/                   el código separado por capas (es lo que conviene editar)
+
+  — simulación: corre tal cual en Node, sin navegador —
+  10_core.js           utilidades, azar con semilla, arena, estado global, eventos
   20_champs.js         campeones, kits de habilidades y reliquias  ← empieza aquí
-  30_combat.js         luchadores, daño, control, proyectiles, zonas, efectos
+  30_combat.js         luchadores, daño, control, proyectiles, zonas, orbes
   40_ai.js             bots: posicionamiento, esquivas, predicción, planes
-  50_match_ui.js       partida, rondas, reliquias, HUD y pantallas
-  60_loop.js           bucle principal, ritmo de ronda y arranque
+  50_match.js          partida, rondas, reliquias y el paso de simulación
+
+  — vista: se puede tirar entera sin que el juego deje de funcionar —
+  00_head.html         <head>, CSS y maquetación de pantallas y HUD
+  60_view.js           three.js, escena, cámara, mallas y sincronización
+  70_fx.js             partículas, sonido y el consumidor de eventos
+  80_ui.js             HUD, placas, pantallas y entrada del jugador
+
+  90_loop.js           el bucle que une las dos mitades
 tests/                 simulación sin navegador (ver abajo)
 docs/                  documentación técnica (ver abajo)
 ```
@@ -40,20 +48,22 @@ docs/                  documentación técnica (ver abajo)
 ```
 
 No hay empaquetador ni instalación: el orden de concatenación es el orden de
-los nombres de archivo, y todo vive en un mismo ámbito.
+los números, y todo vive en un mismo ámbito. Los números no son decorativos —
+10 a 50 son la simulación, 60 a 80 la vista, 90 el bucle.
 
 ## Probar sin navegador
 
-Las pruebas sustituyen three.js y el DOM por dobles mínimos, así que la lógica
-de combate se puede simular a 60 pasos por segundo desde la terminal. Sirve
-para detectar fallos y para medir el equilibrio.
+La mitad de simulación no depende del navegador, así que se puede ejecutar tal
+cual desde la terminal, a 60 pasos por segundo. Sirve para detectar fallos y
+para medir el equilibrio. Solo `e2e.js`, que recorre también la interfaz,
+necesita dobles de three.js y del DOM.
 
 ```bash
 node tests/sim.js           # dos equipos de bots peleando; informa de habilidades usadas
 node tests/e2e.js           # menú -> partida -> rondas -> reliquias -> resultado
 node tests/determinism.js   # misma semilla, misma partida
 node tests/input_cmd.js     # el comando de entrada, de punta a punta
-node tests/lint_rng.js      # ningún Math.random en el camino de simulación
+node tests/lint.js          # azar con semilla y frontera simulación/vista
 ```
 
 `tests/sim.js` es la herramienta útil para retocar números: cambia `comp` para
@@ -73,14 +83,16 @@ En `src/20_champs.js`, copia una entrada de `CHAMPS` y cambia:
 
 - `hp`, `speed`, `role` (`Tirador`, `Vanguardia` o `Custodio`; el rol decide la
   distancia a la que se coloca el bot, en `ROLE_RANGE` de `40_ai.js`).
-- `build(g)`: las mallas del personaje. Con three.js r128 no existe
-  `CapsuleGeometry`, así que se usan cilindros, esferas y conos.
 - `ab`: siete habilidades en este orden fijo, porque el HUD y los controles lo
   asumen: `M1`, `M2`, `SP` (desplazamiento), `Q`, `E`, `F`, `R` (definitiva).
 
 Cada habilidad se escribe con las primitivas de `30_combat.js`: `shoot`,
 `meleeArc`, `coneHeal`, `radial`, `startDash`, `spawnZone`, `buff` y
-`healTarget`. El parámetro `o.ex` indica si se lanzó la versión mejorada.
+`healTarget`. El parámetro `o.ex` indica si se lanzó la versión mejorada. Para
+un efecto visible o audible, un evento: `sfx('nombre')`, `fxRing(...)`.
+
+Las mallas van aparte, en `CHAMP_MESH` de `src/60_view.js`: con three.js r128 no
+existe `CapsuleGeometry`, así que se usan cilindros, esferas y conos.
 
 Después añade el identificador a `CHAMP_LIST` y, si quieres que los bots lo
 jueguen bien, un plan en `BOT_PLANS` de `40_ai.js`.
@@ -120,19 +132,25 @@ implementado, pero el diseño está cerrado en [docs/ONLINE.md](docs/ONLINE.md):
 interpolación**, salas de 1v1 a 3v3, y transporte WebSocket binario detrás de una
 interfaz para poder pasar a WebTransport más adelante.
 
-El activo que lo hace viable es que la simulación **ya corre sin navegador**
-(`tests/`): el servidor autoritativo es ese mismo código.
+**Las etapas 1 y 2 ya están hechas.**
 
-**La etapa 1 ya está hecha**: la simulación avanza en pasos fijos de 1/60, el
-azar lleva semilla, la entrada del jugador es un dato plano que se puede guardar
-y reaplicar, y ninguna entidad guarda referencias a otra. Con la misma semilla,
-una partida se desarrolla exactamente igual paso a paso — lo comprueba
-`tests/determinism.js`. De propina, ahora el equilibrio se puede medir de verdad
-y una repetición cabe en unos pocos kilobytes.
+La simulación avanza en pasos fijos de 1/60, el azar lleva semilla, la entrada
+del jugador es un dato plano que se puede guardar y reaplicar, y ninguna entidad
+guarda referencias a otra. Con la misma semilla, una partida se desarrolla
+exactamente igual paso a paso — lo comprueba `tests/determinism.js`.
 
-Queda la etapa 2 antes de poder enchufar un socket: separar simulación de
-presentación, para que el código de juego no cree mallas de three.js ni llame al
-audio. El plan lo divide en etapas entregables por separado.
+Y el código de juego ya no sabe nada de three.js, del DOM ni del audio: anota lo
+que pasa en una cola de eventos y la vista decide qué hacer con cada anotación.
+`node tests/sim.js` ejecuta la simulación entera sin un solo doble, que era
+precisamente el criterio: **si arranca, existe un servidor autoritativo posible,
+porque es exactamente este código**.
+
+De propina: el equilibrio se puede medir de verdad, y una repetición cabe en
+unos pocos kilobytes (la semilla más la lista de comandos).
+
+Lo siguiente es la etapa 3, que mueve la simulación a un Web Worker con el mismo
+protocolo que usará el servidor, para depurar predicción y reconciliación sin
+servidor de por medio.
 
 ## Lo que no está
 

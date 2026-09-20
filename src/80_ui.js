@@ -2,6 +2,10 @@
 const KEYLBL = { M1: 'Clic', M2: 'Der.', SP: 'Esp', Q: 'Q', E: 'E', F: 'F', R: 'R' };
 const UI = {};
 let plateHost, numPool = [];
+/* Las placas y los marcos son elementos del DOM, así que viven aquí en
+   mapas por id, nunca colgados del luchador. */
+const PLATE = new Map(), FRAME = new Map();
+let announceT = 0;
 
 function initUI() {
   UI.hud = $('hud'); UI.world = $('world');
@@ -13,7 +17,7 @@ function initUI() {
   $('go-help').onclick = () => showScreen('scr-help');
   $('help-back').onclick = () => showScreen(G.state === 'title' ? 'scr-title' : 'scr-title');
   $('setup-back').onclick = () => showScreen('scr-title');
-  $('setup-start').onclick = () => startMatch();
+  $('setup-start').onclick = () => { SFX.init(); startMatch(); };
   $('result-again').onclick = () => { showScreen('scr-setup'); };
   $('result-menu').onclick = () => { showScreen('scr-title'); };
   $('pause-resume').onclick = () => togglePause();
@@ -64,7 +68,6 @@ function initUI() {
     <b>Shift + habilidad</b><span>Versión mejorada (50 energía)</span>`;
 }
 
-const SEL = { mode: 'duo', diff: 'normal', champ: 'vesk' };
 function syncOpts() {
   for (const b of document.querySelectorAll('#opt-mode .opt')) b.setAttribute('aria-pressed', b.dataset.v === SEL.mode);
   for (const b of document.querySelectorAll('#opt-diff .opt')) b.setAttribute('aria-pressed', b.dataset.v === SEL.diff);
@@ -85,7 +88,7 @@ function hideScreens() { for (const s of document.querySelectorAll('.screen')) s
 function announce(big, sub, dur) {
   const a = $('announce');
   a.innerHTML = `<div class="big pop">${big}</div>${sub ? `<div class="sub pop">${sub}</div>` : ''}`;
-  G.announceT = dur || 1.6;
+  announceT = dur || 1.6;
 }
 function clearAnnounce() { $('announce').innerHTML = ''; }
 function feed(html) {
@@ -126,15 +129,16 @@ function makePlate(f) {
     <div class="cast"><i></i></div>`;
   d.q = { cc: d.querySelector('.cc'), hp: d.querySelector('.hp'), sh: d.querySelector('.sh'), cast: d.querySelector('.cast'), castI: d.querySelector('.cast i') };
   plateHost.appendChild(d);
-  f.plate = d;
+  PLATE.set(f.uid, d);
 }
 function updatePlates() {
   for (const f of G.fighters) {
-    const d = f.plate;
-    if (!d) continue;
+    const d = PLATE.get(f.uid), m = VIEW.fighter.get(f.uid);
+    if (!d || !m) continue;
     if (!f.alive) { d.style.display = 'none'; continue; }
     d.style.display = '';
-    tmpV.set(f.mesh.position.x, 2.35, f.mesh.position.z).project(camera);
+    // la placa sigue a la malla, que ya está interpolada, no al último paso
+    tmpV.set(m.position.x, 2.35, m.position.z).project(camera);
     d.style.transform = `translate(${(tmpV.x * .5 + .5) * window.innerWidth}px,${(-tmpV.y * .5 + .5) * window.innerHeight}px) translate(-50%,-100%)`;
     d.q.hp.style.transform = `scaleX(${clamp(f.hp / f.maxHp, 0, 1)})`;
     d.q.sh.style.transform = `scaleX(${clamp(f.shield / f.maxHp, 0, 1)})`;
@@ -196,7 +200,7 @@ function buildTeamFrames() {
       <div class="hpb"><i class="sh"></i><i class="hp"></i></div><div class="enb"><i></i></div></div>`;
     d.q = { hp: d.querySelector('.hp'), sh: d.querySelector('.sh'), en: d.querySelector('.enb i'), n: d.querySelector('.hpn') };
     host.appendChild(d);
-    f.frame = d;
+    FRAME.set(f.uid, d);
   }
   for (const side of ['a', 'b']) {
     const box = $('pips-' + side);
@@ -240,7 +244,7 @@ function updateHUD() {
   }
 
   for (const o of G.fighters) {
-    const d = o.frame;
+    const d = FRAME.get(o.uid);
     if (!d) continue;
     d.classList.toggle('dead', !o.alive);
     d.classList.toggle('ult', o.alive && o.energy >= 100 - (o.mods.ultCost || 0));
@@ -279,158 +283,228 @@ function updateHUD() {
   $('vignette').style.opacity = f.alive ? String(clamp(1 - f.hp / f.maxHp / .45, 0, 1) * .8) : '.8';
 }
 
-/* ============================ partida ============================ */
-function spawnPoints(team, n) {
-  const x = team === 0 ? -14.5 : 14.5;
-  const out = [];
-  for (let i = 0; i < n; i++) out.push({ x, z: (i - (n - 1) / 2) * 3.4, a: team === 0 ? Math.PI / 2 : -Math.PI / 2 });
+/* ============================ entrada ============================ */
+const Input = {
+  keys: Object.create(null), mouse: { x: 0, y: 0 }, m1: false, m2: false, shift: false,
+  aim: new THREE.Vector3(1, 0, 0), aimDir: { x: 1, z: 0 },
+  touch: false, moveVec: { x: 0, z: 0 }, tAim: { x: 0, z: 0 }, tFire: false,
+  queued: null
+};
+const _ray = new THREE.Raycaster(), _plane = new THREE.Plane(new THREE.Vector3(0, 1, 0), -1.0), _ndc = new THREE.Vector2();
+
+function screenToGround(cx, cy, out) {
+  _ndc.set((cx / window.innerWidth) * 2 - 1, -(cy / window.innerHeight) * 2 + 1);
+  _ray.setFromCamera(_ndc, camera);
+  if (!_ray.ray.intersectPlane(_plane, out)) out.set(0, 1, 0);
   return out;
 }
 
-/* `seed` sirve para repetir una partida entera: con la misma semilla y la
-   misma entrada, el combate se desarrolla igual paso a paso. Si no se pasa, se
-   sortea una y se guarda en G.seed. */
-function startMatch(seed) {
-  SFX.init();
-  quitMatch();
-  G.seed = seed === undefined ? (frand() * 0xFFFFFFFF) >>> 0 : (seed >>> 0);
-  seedSim(G.seed);
-  G.mode = MODES[SEL.mode];
-  G.diff = SEL.diff;
-  G.wins = G.mode.wins;
-  G.round = 1; G.score = [0, 0]; G.picks = 0;
-  G.playerTeam = 0;
-  G.roundLimit = G.mode.time || 9999;
+function initInput() {
+  addEventListener('keydown', e => {
+    const k = e.key.toLowerCase();
+    if (k === 'shift') Input.shift = true;
+    Input.keys[k] = true;
+    if (k === 'escape') { e.preventDefault(); togglePause(); }
+    if ([' ', 'q', 'e', 'r', 'f', 'w', 'a', 's', 'd'].includes(k)) e.preventDefault();
+  });
+  addEventListener('keyup', e => {
+    const k = e.key.toLowerCase();
+    if (k === 'shift') Input.shift = false;
+    Input.keys[k] = false;
+  });
+  addEventListener('blur', () => { Input.keys = Object.create(null); Input.m1 = Input.m2 = false; });
+  const cv = $('gl');
+  cv.addEventListener('contextmenu', e => e.preventDefault());
+  addEventListener('pointermove', e => {
+    if (e.pointerType === 'touch') return;
+    Input.mouse.x = e.clientX; Input.mouse.y = e.clientY;
+  });
+  cv.addEventListener('pointerdown', e => {
+    if (e.pointerType === 'touch') return;
+    if (e.button === 0) Input.m1 = true;
+    if (e.button === 2) Input.m2 = true;
+  });
+  addEventListener('pointerup', e => {
+    if (e.pointerType === 'touch') return;
+    if (e.button === 0) Input.m1 = false;
+    if (e.button === 2) Input.m2 = false;
+  });
+  Input.touch = matchMedia('(pointer:coarse)').matches;
+  if (Input.touch) initTouch();
+}
 
-  const n = G.mode.size;
-  // composición: nunca repetir campeón dentro de un equipo si se puede evitar
-  const teamComp = t => {
-    const list = [];
-    const rest = CHAMP_LIST.filter(c => !(t === 0 && c === SEL.champ));
-    if (t === 0) list.push(SEL.champ);
-    const order = t === 0 ? ['brakk', 'lumen', 'vesk'] : ['lumen', 'vesk', 'brakk'];
-    for (const c of order) {
-      if (list.length >= n) break;
-      if (list.includes(c)) continue;
-      if (t === 0 && !rest.includes(c)) continue;
-      list.push(c);
-    }
-    while (list.length < n) list.push(pickOne(CHAMP_LIST));
-    return list.slice(0, n);
+function updateAim() {
+  if (Input.touch && (Input.tAim.x || Input.tAim.z)) {
+    Input.aimDir.x = Input.tAim.x; Input.aimDir.z = Input.tAim.z;
+    if (G.player) Input.aim.set(G.player.pos.x + Input.tAim.x * 12, 1, G.player.pos.z + Input.tAim.z * 12);
+    return;
+  }
+  screenToGround(Input.mouse.x, Input.mouse.y, Input.aim);
+  if (G.player) {
+    const dx = Input.aim.x - G.player.pos.x, dz = Input.aim.z - G.player.pos.z;
+    const d = Math.hypot(dx, dz) || 1;
+    Input.aimDir.x = dx / d; Input.aimDir.z = dz / d;
+  }
+}
+
+function moveInput() {
+  if (Input.touch) return { x: Input.moveVec.x, z: Input.moveVec.z };
+  let x = 0, z = 0;
+  if (Input.keys['w'] || Input.keys['arrowup']) z -= 1;
+  if (Input.keys['s'] || Input.keys['arrowdown']) z += 1;
+  if (Input.keys['a'] || Input.keys['arrowleft']) x -= 1;
+  if (Input.keys['d'] || Input.keys['arrowright']) x += 1;
+  const d = Math.hypot(x, z);
+  return d > 0 ? { x: x / d, z: z / d } : { x: 0, z: 0 };
+}
+
+/* Muestrear es cosa de la vista: lee el teclado, el ratón o los joysticks y
+   produce el comando que define 10_core.js. Aplicarlo es cosa de la
+   simulación (`applyInput`, en 30_combat.js). */
+function sampleInput(seq) {
+  updateAim();
+  const f = G.player;
+  const mv = moveInput();
+  const dx = Input.aim.x - (f ? f.pos.x : 0), dz = Input.aim.z - (f ? f.pos.z : 0);
+  let buttons = 0, ex = Input.shift || Input.exMode;
+  if (Input.queued) {
+    buttons |= 1 << Input.queued.i;
+    if (Input.queued.ex) ex = true;
+    Input.queued = null;
+    if (Input.exMode) { Input.exMode = false; syncEx(); }
+  }
+  if (Input.m1 || (Input.touch && Input.tFire)) buttons |= BTN.M1;
+  if (Input.m2) buttons |= BTN.M2;
+  if (Input.keys[' ']) buttons |= BTN.SP;
+  if (Input.keys['q']) buttons |= BTN.Q;
+  if (Input.keys['e']) buttons |= BTN.E;
+  if (Input.keys['f']) buttons |= BTN.F;
+  if (Input.keys['r']) buttons |= BTN.R;
+  return {
+    seq,
+    move: (mv.x || mv.z) ? dirToByte(mv.x, mv.z) : CMD_STILL,
+    aim: dirToByte(Input.aimDir.x, Input.aimDir.z),
+    aimD: clamp(Math.round(Math.hypot(dx, dz) * 10), 0, 255),
+    buttons, ex: ex ? 1 : 0
   };
-  for (let t = 0; t < 2; t++) {
-    const comp = teamComp(t);
-    comp.forEach((cid, i) => {
-      const isBot = !(t === 0 && i === 0);
-      const f = makeFighter(cid, t, isBot, isBot ? BOT_NAMES[t][i % 4] : 'Tú');
-      if (isBot) makeAI(f, G.diff);
-      else G.player = f;
-      G.fighters.push(f);
-      makePlate(f);
+}
+
+/* --- controles táctiles --- */
+function initTouch() {
+  $('touch').classList.remove('hidden');
+  const mk = (node, onMove, onEnd) => {
+    let id = null; const R = 52;
+    const nub = node.querySelector('.nub');
+    const rect = () => node.getBoundingClientRect();
+    node.addEventListener('pointerdown', e => {
+      if (id !== null) return;
+      id = e.pointerId; node.setPointerCapture(id); handle(e);
     });
-  }
-  buildAbilityBar(G.player.champ);
-  buildTeamFrames();
-  hideScreens();
-  G.started = true;
-  if (G.mode.id === 'training') { beginRound(); announce('Entrenamiento', 'Los bots reaparecen solos', 2); }
-  else openRelicPick();
+    node.addEventListener('pointermove', e => { if (e.pointerId === id) handle(e); });
+    const up = e => {
+      if (e.pointerId !== id) return;
+      id = null; nub.style.transform = '';
+      onMove(0, 0); if (onEnd) onEnd();
+    };
+    node.addEventListener('pointerup', up);
+    node.addEventListener('pointercancel', up);
+    function handle(e) {
+      const r = rect();
+      let dx = e.clientX - (r.left + r.width / 2), dy = e.clientY - (r.top + r.height / 2);
+      const d = Math.hypot(dx, dy);
+      const k = d > R ? R / d : 1;
+      nub.style.transform = `translate(${dx * k}px,${dy * k}px)`;
+      const n = Math.max(d, 1);
+      onMove(dx / n * Math.min(1, d / R), dy / n * Math.min(1, d / R));
+    }
+  };
+  mk($('stick-l'), (x, y) => { Input.moveVec.x = x; Input.moveVec.z = y; });
+  mk($('stick-r'), (x, y) => {
+    const d = Math.hypot(x, y);
+    if (d > .25) { Input.tAim.x = x / d; Input.tAim.z = y / d; Input.tFire = true; }
+    else Input.tFire = false;
+  }, () => { Input.tFire = false; });
 }
 
-function quitMatch() {
-  for (const f of G.fighters) { scene.remove(f.mesh); if (f.plate) f.plate.remove(); }
-  G.fighters.length = 0;
-  G.byId.clear();
-  _uid = 0;                 // los ids arrancan de cero en cada partida, como en un servidor
-  G.player = null; G.started = false; G.sudden = false; G.shrink = 1;
-  sdRing.visible = false;
-  clearTransient();
-  clearAnnounce();
-  $('feed').innerHTML = '';
-  G.paused = false;
+/* ============================ eventos de partida ============================ */
+/* Lo que la simulación anuncia y que se traduce en pantallas, avisos y texto.
+   La simulación no sabe que «Ronda ganada» se escribe así, ni que hay una
+   pantalla de reliquias: solo dice lo que ha pasado. */
+function uiEvent(ev) {
+  switch (ev.e) {
+    case 'matchStart':
+      buildAbilityBar(G.player.champ);
+      for (const f of G.fighters) makePlate(f);
+      buildTeamFrames();
+      hideScreens();
+      break;
+
+    case 'matchEnd':                       // también al salir al menú
+      for (const d of PLATE.values()) d.remove();
+      PLATE.clear(); FRAME.clear();
+      clearAnnounce();
+      $('feed').innerHTML = '';
+      break;
+
+    case 'training':
+      announce('Entrenamiento', 'Los bots reaparecen solos', 2);
+      break;
+
+    case 'roundStart':
+      if (!ev.training) announce(`Ronda ${ev.round}`, `${ev.score[0]} · ${ev.score[1]}`, 1.7);
+      playSound('round');
+      break;
+
+    case 'roundEnd': {
+      if (ev.winner < 0) { announce('Empate', 'Nadie cede', 3); break; }
+      const pips = $('pips-' + (ev.winner === G.playerTeam ? 'a' : 'b')).children;
+      if (pips[ev.score[ev.winner] - 1]) pips[ev.score[ev.winner] - 1].classList.add('on');
+      const mine = ev.winner === G.playerTeam;
+      announce(mine ? 'Ronda ganada' : 'Ronda perdida',
+        `${ev.score[G.playerTeam]} · ${ev.score[1 - G.playerTeam]}`, 3);
+      playSound(mine ? 'win' : 'lose');
+      break;
+    }
+
+    case 'countdown':
+      if (ev.n > 0) { announce(String(ev.n), '', .9); playSound('tick'); }
+      else { announce('¡Ya!', '', .8); playSound('go'); }
+      break;
+
+    case 'sudden':
+      announce('Muerte súbita', 'La arena se cierra', 2.2);
+      playSound('sudden');
+      break;
+
+    case 'orbSpawn':
+      if (ev.kind === 'energy') feed('Orbe de energía en el centro');
+      break;
+
+    case 'relics': showRelics(ev.picks, ev.of); break;
+    case 'matchResult': showResult(ev.winner); break;
+    case 'pause': ev.on ? showScreen('scr-pause') : hideScreens(); break;
+  }
 }
 
-function beginRound() {
-  const n = G.mode.size;
-  for (const t of [0, 1]) {
-    const pts = spawnPoints(t, n);
-    let i = 0;
-    for (const f of G.fighters) if (f.team === t) { const p = pts[i++]; resetFighter(f, p.x, p.z, p.a); }
-  }
-  clearTransient();
-  G.roundTime = 0; G.sudden = false; G.shrink = 1;
-  G.firstBlood = false;
-  sdRing.visible = false;
-  G.nextOrb = 18; G.nextHeal = 26;
-  G.state = 'intro';
-  G.introT = 3.2;
-  if (G.mode.id !== 'training') announce(`Ronda ${G.round}`, `${G.score[0]} · ${G.score[1]}`, 1.7);
-  SFX.round();
-}
-
-function endRound(winner) {
-  if (G.state !== 'live') return;
-  G.state = 'roundend';
-  G.roundEndT = 3.4;
-  if (winner >= 0) {
-    G.score[winner]++;
-    for (const f of G.fighters) if (f.team === winner) f.stats.rounds++;
-    const pips = $('pips-' + (winner === G.playerTeam ? 'a' : 'b')).children;
-    if (pips[G.score[winner] - 1]) pips[G.score[winner] - 1].classList.add('on');
-    const mine = winner === G.playerTeam;
-    announce(mine ? 'Ronda ganada' : 'Ronda perdida', `${G.score[G.playerTeam]} · ${G.score[1 - G.playerTeam]}`, 3);
-    mine ? SFX.win() : SFX.lose();
-  } else {
-    announce('Empate', 'Nadie cede', 3);
-  }
-  G.timeScale = .35;
-}
-
-function openRelicPick() {
-  G.picks++;
-  G.state = 'brite';
-  const taken = new Set(G.player.relics.map(r => r.id));
-  const pool = RELICS.filter(r => !taken.has(r.id));
-  const opts = [];
-  const byRar = r => pool.filter(x => x.r === r && !opts.includes(x));
-  const wantEpic = G.picks >= 3 ? 1 : 0;
-  while (opts.length < 3) {
-    let cand;
-    if (opts.length === 0) cand = pickOne(byRar('com'));
-    else if (opts.length === 1) cand = pickOne(byRar(chance(.6) ? 'rare' : 'com'));
-    else cand = pickOne(byRar(wantEpic && chance(.55) ? 'epic' : 'rare'));
-    if (!cand) cand = pickOne(pool.filter(x => !opts.includes(x)));
-    if (!cand) break;
-    opts.push(cand);
-  }
-  $('brite-title').textContent = `Reliquia ${G.picks} de ${G.wins + 2}`;
+/* ---------- pantalla de reliquias ---------- */
+/* Las tres opciones las sorteó la simulación y están en G.relicOptions; aquí
+   solo se pintan y se avisa de cuál eligió el jugador. */
+function showRelics(picks, of) {
+  $('brite-title').textContent = `Reliquia ${picks} de ${of}`;
   $('brite-sub').textContent = 'Se queda contigo hasta el final del combate.';
   const box = $('brite-cards');
   box.innerHTML = '';
-  opts.forEach(r => {
+  (G.relicOptions || []).forEach((r, i) => {
     const b = el('button', 'card ' + (r.r === 'com' ? '' : r.r));
     b.innerHTML = `<span class="rune">${r.rune}</span><h4>${r.n}</h4><p>${r.d}</p><span class="tag">${RELIC_TAG[r.r]}</span>`;
-    b.onclick = () => {
-      applyRelic(G.player, r);
-      for (const f of G.fighters) {
-        if (f === G.player || !f.isBot) continue;
-        const own = new Set(f.relics.map(x => x.id));
-        const p = RELICS.filter(x => !own.has(x.id));
-        const three = [pickOne(p), pickOne(p), pickOne(p)].filter(Boolean);
-        const chosen = botPickRelic(f, three.length ? three : [pickOne(RELICS)]);
-        if (chosen) applyRelic(f, chosen);
-      }
-      hideScreens();
-      beginRound();
-    };
+    b.onclick = () => { if (pickRelic(i)) hideScreens(); };
     box.appendChild(b);
   });
   showScreen('scr-brite');
-  G.state = 'brite';
 }
 
-function endMatch(winner) {
-  G.state = 'result';
+/* ---------- pantalla de resultado ---------- */
+function showResult(winner) {
   const mine = winner === G.playerTeam;
   $('result-title').textContent = mine ? 'Victoria' : 'Derrota';
   $('result-sub').textContent = `${G.score[G.playerTeam]} · ${G.score[1 - G.playerTeam]} en ${G.mode.name}. ${mine ? 'La arena es tuya.' : 'La próxima vez.'}`;
@@ -444,12 +518,13 @@ function endMatch(winner) {
   }
   showScreen('scr-result');
   clearAnnounce();
-  mine ? SFX.win() : SFX.lose();
+  playSound(mine ? 'win' : 'lose');
 }
 
-function togglePause() {
-  if (!G.started) return;
-  if (G.state === 'brite' || G.state === 'result') return;
-  if (G.paused) { G.paused = false; hideScreens(); }
-  else { G.paused = true; showScreen('scr-pause'); }
+/* El aviso grande se apaga solo, en tiempo real: no depende del ritmo de la
+   simulación, así que la cámara lenta del remate no lo alarga. */
+function tickAnnounce(raw) {
+  if (announceT <= 0) return;
+  announceT -= raw;
+  if (announceT <= 0) clearAnnounce();
 }

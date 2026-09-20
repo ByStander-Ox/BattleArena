@@ -1,4 +1,7 @@
-/* ---- stubs mínimos para ejecutar la lógica en Node ---- */
+/* ---- dobles mínimos de three.js para ejecutar la VISTA en Node ----
+   Desde la etapa 2 la mitad de simulación (src/10 a 50) no necesita nada de
+   esto: `node tests/sim.js` la corre tal cual. Estos dobles solo hacen falta
+   en tests/e2e.js, que sí carga la mitad de vista. */
 function _Vec(x, y, z) { this.x = x || 0; this.y = y || 0; this.z = z || 0; }
 _Vec.prototype.set = function (x, y, z) { this.x = x; this.y = y; this.z = z; return this; };
 _Vec.prototype.copy = function (v) { this.x = v.x; this.y = v.y; this.z = v.z; return this; };
@@ -71,7 +74,4 @@ globalThis.document = {
 globalThis.addEventListener = () => { };
 globalThis.matchMedia = () => ({ matches: false });
 globalThis.requestAnimationFrame = () => { };
-globalThis.floatNum = () => { };
-globalThis.feed = () => { };
-globalThis.announce = () => { };
 globalThis.devicePixelRatio = 1;
