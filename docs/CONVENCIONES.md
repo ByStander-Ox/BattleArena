@@ -21,10 +21,17 @@ Estas cinco rompen el juego de formas que no dan error en consola:
    `00_head.html` no aporta ninguna. Si algún día añades un `05_algo.js`, mueve
    la directiva a su primera línea o el modo estricto se apaga en silencio.
 4. **El orden de `ab[]` es contrato.** `M1, M2, SP, Q, E, F, R`, siempre siete.
-   `playerControl`, `buildAbilityBar` y `BOT_PLANS` indexan por posición.
+   `applyInput`, `buildAbilityBar` y `BOT_PLANS` indexan por posición.
    Reordenar es reasignar teclas sin querer.
 5. **Conserva la rotación de `fightersInOrder()`.** Procesar siempre en el mismo
    orden da ventaja sistemática al primero. Se midió: espejo de Brakk, 58-2.
+6. **Dentro de la simulación, solo `srand` y sus ayudantes.** `rnd`, `irnd`,
+   `pickOne` y `chance` llevan semilla; `frand`, `frnd` y `firnd` son para
+   partículas y adornos. Un `Math.random()` en el camino de simulación rompe el
+   determinismo sin dar ningún error, y ese es el fallo más caro de encontrar
+   que tiene este proyecto por delante. `node tests/lint_rng.js` lo impide.
+7. **Lo que cambia el estado va en `simStep`, y recibe `STEP`.** Nunca `raw`, ni
+   el delta del fotograma. Lo que dibuja va en `frame` y puede usar `raw`.
 
 ---
 
@@ -122,28 +129,37 @@ después.
 ## 5. Flujo de trabajo
 
 ```bash
-./build.sh              # src/ → crisol-arena.html
-node tests/sim.js       # equilibrio y salud de la simulación (~300 ms)
-node tests/e2e.js       # recorrido completo del juego
+./build.sh                  # src/ → crisol-arena.html
+node tests/sim.js           # equilibrio y salud de la simulación (~300 ms)
+node tests/e2e.js           # recorrido completo del juego
+node tests/determinism.js   # misma semilla ⇒ misma partida
+node tests/input_cmd.js     # el comando de entrada, de punta a punta
+node tests/lint_rng.js      # ningún Math.random en el camino de simulación
 ```
 
 El ciclo normal es: editar `src/` → `./build.sh` → recargar el navegador. Los
 tests no necesitan compilar; leen `src/` directamente.
 
-**Antes de dar algo por terminado, los dos tests pasan.** `sim.js` lanza
-excepción con posiciones `NaN` o luchadores fuera de la arena, y `e2e.js`
-recorre menú, rondas, reliquias y resultado. Entre los dos cogen la mayoría de
-las regresiones estructurales.
+**Antes de dar algo por terminado, los cinco tests pasan.** `sim.js` lanza
+excepción con posiciones `NaN` o luchadores fuera de la arena; `e2e.js` recorre
+menú, rondas, reliquias y resultado; `determinism.js` protege lo que costó
+conseguir en la etapa 1. Entre todos cogen la mayoría de las regresiones
+estructurales.
 
 **Cambios de equilibrio: mide, no opines.** Edita `comp` y `SIZE` en
-`tests/test_drive.js` para enfrentar dos campeones concretos, sube las rondas a
-40-60 y compara el marcador antes y después. Doce rondas son ruido; cuarenta ya
-son señal. Ten presente que mide bots: un humano apunta mucho mejor que el bot
-de Vesk, así que un tirador siempre rinde más en manos humanas que en la tabla.
+`tests/test_drive.js` para enfrentar dos campeones concretos y usa las variables
+de entorno para fijar la muestra:
 
-**Sin git todavía.** El proyecto no está versionado. Antes del refactor que pide
-el modo online conviene `git init` y un primer commit con el estado actual: ese
-refactor toca los seis archivos a la vez y querrás poder volver.
+```bash
+SIM_SEED=7 SIM_ROUNDS=60 node tests/sim.js     # antes del cambio
+SIM_SEED=7 SIM_ROUNDS=60 node tests/sim.js     # después: misma secuencia exacta
+```
+
+Con la misma semilla las dos ejecuciones enfrentan **las mismas partidas**, así
+que la diferencia de marcador es el efecto de tu cambio y no del azar. Doce
+rondas son ruido; cuarenta ya son señal. Ten presente que mide bots: un humano
+apunta mucho mejor que el bot de Vesk, así que un tirador siempre rinde más en
+manos humanas que en la tabla.
 
 ---
 
@@ -197,18 +213,21 @@ nuevo es coste permanente en el sitio más caliente del código.
 
 ## 7. Deuda técnica conocida
 
-No hace falta arreglarla para seguir añadiendo contenido local, pero el modo
-online sí la va a exigir. En orden de coste:
+La etapa 1 del plan de red saldó cinco de las siete deudas que había aquí: paso
+fijo, azar con semilla, entrada como dato, `pos` plano y referencias por id.
+Queda esto:
 
 | Qué | Dónde | Por qué molesta |
 |---|---|---|
-| Paso variable | `frame()` | sin paso fijo no hay simulación reproducible |
-| `Math.random()` suelto | `40_ai.js`, `30_combat.js` | sin semilla no hay repetición ni depuración de una partida |
-| Simulación acoplada al render | `makeFighter`, `shoot`, `spawnZone` | crean mallas; el servidor no tiene escena |
+| Simulación acoplada al render | `makeFighter`, `shoot`, `spawnZone` | crean mallas; un servidor no tiene escena |
 | `act()` llama a `SFX` | `20_champs.js` | los datos de habilidad dependen del audio |
-| `pos` es `THREE.Vector3` | luchadores | un tipo de la capa de render dentro del estado |
-| Referencias cruzadas | `proj.owner`, `zone.owner` | impiden serializar `G` con `JSON.stringify` |
+| Presentación dentro de la simulación | `dealDamage`, `killFighter`, `updateRound` | llaman a `floatNum`, `feed`, `shake`, tocan `sdRing` |
 | `G` es un singleton | `10_core.js` | un servidor necesita N partidas por proceso |
 
-El plan para saldarla está en [ONLINE.md](ONLINE.md) §4, ordenado para que cada
-etapa se pueda entregar y probar por separado.
+Las tres primeras son la etapa 2 y se resuelven con lo mismo: que la simulación
+**emita eventos** y la vista los consuma. La cuarta se pospone a propósito — un
+proceso por partida es suficiente hasta cifras de usuarios que este proyecto no
+va a ver pronto.
+
+El plan completo está en [ONLINE.md](ONLINE.md) §4, ordenado para que cada etapa
+se pueda entregar y probar por separado.

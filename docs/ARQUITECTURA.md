@@ -49,7 +49,11 @@ renderizar texto en 3D.
 
 ### `10_core.js` — cimientos
 
-- **Utilidades**: `clamp`, `lerp`, `rnd`, `dist2`, `angDiff`, `damp`, `$`, `el`.
+- **Utilidades**: `clamp`, `lerp`, `dist2`, `angDiff`, `damp`, `vec3`, `$`, `el`.
+- **Aleatoriedad en dos juegos**: `srand`/`rnd`/`irnd`/`pickOne`/`chance` son
+  deterministas y con semilla, los únicos permitidos dentro de la simulación;
+  `frand`/`frnd`/`firnd` son cosméticos. Ver [ONLINE.md](ONLINE.md) §3.2.
+- **Tiempo**: `STEP` (1/60 s) y `MAX_STEPS`. El paso de simulación es fijo.
 - **Geometría de arena**: `ARENA` es un rectángulo redondeado (`hx:19`, `hz:13`,
   radio `7.5`). `insideArena`, `edgeDepth`, `pushInside`, `collidePillars` y
   `segHitsPillar` son las únicas funciones que saben de la forma del suelo —
@@ -59,7 +63,8 @@ renderizar texto en 3D.
 - **`MODES` y `DIFFS`**: tablas de configuración de modo y de dificultad de bot.
 - **Motor**: `initEngine`, luces, textura de suelo generada en un `<canvas>` 2D
   (no hay assets externos), cámara y `updateCamera`.
-- **`Input`**: teclado, ratón y joysticks táctiles si `pointer:coarse`.
+- **`Input`** y el **comando de entrada**: teclado, ratón y joysticks táctiles
+  si `pointer:coarse`; `sampleInput(seq)` los convierte en un dato plano.
 - **`SFX`**: síntesis con `OscillatorNode`. No hay archivos de audio.
 
 ### `20_champs.js` — datos de campeones
@@ -156,6 +161,8 @@ G = {
   state,                 // title | setup | intro | live | roundend | brite | result
   mode, diff,            // referencias a MODES/DIFFS
   fighters, projectiles, zones, pickups, fx,   // todas las entidades vivas
+  byId,                  // uid -> luchador
+  seed,                  // semilla: basta para repetir la partida entera
   player,                // el luchador del humano (null en simulación)
   t, dt, paused,
   round, score, roundTime, sudden, shrink,
@@ -165,10 +172,10 @@ G = {
 ```
 
 Un único objeto mutable, sin copias. Sirve porque hay exactamente una partida
-por pestaña. **No es serializable ni clonable tal cual**: contiene referencias a
-objetos de three.js y referencias cruzadas entre entidades (`proj.owner` apunta
-a un luchador, `zone.owner` también). Es el primer obstáculo real del modo
-online.
+por pestaña. Ninguna entidad guarda ya una referencia a otra: todas se señalan
+por `uid` y se resuelven contra `G.byId` con `fighterById(id)`. Lo que aún
+impide serializarlo son las mallas de three.js que cuelgan de cada entidad
+([ONLINE.md](ONLINE.md) §3.3, etapa 2).
 
 ### Máquina de estados
 
@@ -187,30 +194,38 @@ title ──▶ setup ──▶ [brite] ──▶ intro ──▶ live ──▶
 
 ## 4. El bucle, paso a paso
 
-`frame()` en `60_loop.js`, y el orden **no es casual**:
+El bucle está partido en dos piezas con responsabilidades distintas: `simStep`
+avanza el juego, `frame` dibuja.
 
 ```
-requestAnimationFrame
-│
-├─ raw = min(0.05, clock.getDelta())        ← techo anti-salto al volver a la pestaña
-│
-├─ si (started && !paused && estado simulable):
-│   ├─ dt = raw × timeScale
-│   ├─ playerControl()                      entrada humana → moveDir/aimDir
-│   ├─ G.order++ ; order = fightersInOrder()   ← rotación, ver abajo
-│   ├─ updateAI(f) para cada bot            entrada de bot → moveDir/aimDir
-│   ├─ tickFighter(f) para cada luchador    aplica intenciones al mundo
-│   ├─ updateProjectiles / updateZones / updatePickups
-│   ├─ velEst por luchador                  (lo usa predictPos de los bots)
-│   ├─ updateFighterVisual                  estado → mallas
-│   ├─ updateRound(dt)                      ritmo, muerte súbita, fin de ronda
-│   └─ updateHUD / updatePlates
-│
-├─ updateFx / updateFloats / updateEmbers / updateCamera    ← siempre, con `raw`
-└─ renderer.render()
+frame()                                     <- una vez por fotograma
+|
++- raw = min(0.25, clock.getDelta())
+|
++- si (started && !paused && estado simulable):
+|   +- _acc += raw x timeScale              <- tiempo de JUEGO, no real
+|   +- mientras _acc >= STEP (máx. 5):  simStep(STEP);  _acc -= STEP
+|
++- alpha = _acc / STEP                      <- fracción de paso pendiente
++- updateFighterVisual(f, alpha)            estado -> mallas, interpolando
++- updateProjectileVisual(alpha)
++- updateHUD / updatePlates
++- updateFx / updateFloats / updateEmbers / updateCamera   <- con `raw`
+   renderer.render()
+
+simStep(dt)                                 <- exactamente 1/60 s de juego
+|
++- guarda px/pz/pface de cada luchador y proyectil
++- playerControl()          sampleInput -> comando -> applyInput
++- G.order++ ; fightersInOrder()            <- rotación, ver abajo
++- updateAI(f) para cada bot                entrada de bot -> moveDir/aimDir
++- tickFighter(f) para cada luchador        aplica intenciones al mundo
++- updateProjectiles / updateZones / updatePickups
++- velEst por luchador                      (lo usa predictPos de los bots)
++- updateRound(dt)                          ritmo, muerte súbita, fin de ronda
 ```
 
-Tres detalles que hay que preservar:
+Cuatro detalles que hay que preservar:
 
 **Rotación del orden de actualización.** `fightersInOrder()` desplaza el índice
 inicial un puesto cada fotograma. Sin esto, quien se procesa primero gana
@@ -220,9 +235,14 @@ siempre el intercambio en cuerpo a cuerpo: un espejo de Brakk terminaba 58-2.
 (tiempo real); la simulación usa `dt` (tiempo de juego, escalado en cámara
 lenta). Mezclarlos hace que la cámara se arrastre en el remate de ronda.
 
-**Todo depende de `dt`.** No hay paso fijo: el juego corre más *suave*, no más
-rápido, a 144 Hz. Correcto para un juego local, insuficiente para red —
-[ONLINE.md](ONLINE.md) §3.1.
+**El paso es fijo.** `simStep` siempre recibe 1/60. Si el fotograma dura más, se
+dan varios pasos; si dura menos, ninguno. La cámara lenta del remate de ronda
+escala el *acumulador*, no el paso: da menos pasos, nunca pasos más cortos.
+
+**La vista interpola.** Con paso fijo a 60 Hz y pantalla a 144, dibujar la última
+posición simulada se vería a tirones. Cada luchador y cada proyectil guardan la
+posición del paso anterior (`px`, `pz`, `pface`) y la vista mezcla las dos según
+`alpha`. Si añades una entidad que se mueva, dale el mismo tratamiento.
 
 ---
 
@@ -235,11 +255,12 @@ Lo crea `makeFighter(champId, team, isBot, name)`. Campos por grupos:
 | Grupo | Campos | Nota |
 |---|---|---|
 | identidad | `uid`, `champ`, `team`, `isBot`, `name` | `uid` ya sirve como id de red |
-| espacio | `pos` (Vector3), `face`, `aimDir`, `aimPt`, `moveDir` | `moveDir`/`aimDir` son **la entrada**, no el resultado |
+| espacio | `pos`, `face`, `aimDir`, `aimPt`, `moveDir` | objetos planos; `moveDir`/`aimDir` son **la entrada**, no el resultado |
+| paso anterior | `px`, `pz`, `pface`, `velEst` | para estimar velocidad e interpolar la vista |
 | recursos | `maxHp`, `hp`, `shield`, `shieldT`, `energy`, `alive` | energía 0-100, la definitiva cuesta 100 |
 | habilidades | `cds[]`, `casting`, `combo`, `comboT`, `echoT` | `casting = {i, ab, o, t, dur, root}` |
 | estados | `st.{stun,root,silence,slow,slowAmt,haste,hasteAmt,invuln,evade,dr,drAmt,mark,autoT}` | todos son **segundos restantes** |
-| física | `dash`, `knock`, `falling` | excluyentes con el movimiento normal |
+| física | `dash`, `knock`, `falling`, `lastHitById` | excluyentes con el movimiento normal |
 | control | `ccDR.{stun,root,silence}.{n,t}` | contador de rendimientos decrecientes |
 | reliquias | `mods.*`, `relics[]` | `mods` es la suma de todas las reliquias |
 | presentación | `mesh`, `plate`, `hitFlash`, `bob`, `anim` | **debería estar fuera** |
@@ -251,15 +272,15 @@ acumulados de partida.
 
 ### Proyectil
 
-Plano, sin herencia: `{x, z, dx, dz, speed, radius, range, traveled, dmg,
-healAlly, kb, pull, cc, ccT, cc2, cc2T, pierce, chain, team, owner, hit[], mesh,
-alive, col}`. `hit[]` evita golpear dos veces al mismo objetivo con un proyectil
-perforante.
+Plano, sin herencia: `{x, z, px, pz, dx, dz, speed, radius, range, traveled,
+dmg, healAlly, kb, pull, cc, ccT, cc2, cc2T, pierce, chain, team, ownerId,
+hit[], mesh, alive, col}`. `hit[]` guarda **uids**, no referencias, y evita
+golpear dos veces al mismo objetivo con un proyectil perforante.
 
 ### Zona
 
 `{x, z, radius, dur, t, delay, tick, tickT, tickDmg, tickHeal, dmg, cc, ccT,
-slow, trap, friendly, rain, team, owner, mesh, ring, alive, col}`. Cubre trampa
+slow, trap, friendly, rain, team, ownerId, mesh, ring, alive, col}`. Cubre trampa
 (`trap`: se arma tras `delay` y se gasta con el primero que entra), daño o cura
 por tick, y la lluvia de la definitiva de Vesk.
 
@@ -328,13 +349,22 @@ hace lo propio con el DOM. Eso permite ejecutar **la lógica real, sin tocar ni
 una línea**, en Node:
 
 ```bash
-node tests/sim.js     # 12 rondas de bots contra bots, 3v3, ~300 ms
-node tests/e2e.js     # menú → partida → rondas → reliquias → resultado
+node tests/sim.js           # 12 rondas de bots contra bots, 3v3, ~300 ms
+node tests/e2e.js           # menú → partida → rondas → reliquias → resultado
+node tests/determinism.js   # misma semilla ⇒ misma partida
+node tests/input_cmd.js     # cuantización, botones y punto de apuntado
+node tests/lint_rng.js      # ningún Math.random en el camino de simulación
 ```
 
 `sim.js` además verifica invariantes duros: posiciones `NaN` y luchadores fuera
 de la arena lanzan excepción. Y cuenta habilidades lanzadas, lo que detecta kits
 rotos (`sin usar: vesk.R` significa que ningún bot llegó a los 100 de energía).
+Acepta `SIM_SEED` y `SIM_ROUNDS`, así que un ajuste de equilibrio se mide contra
+la misma secuencia exacta de partidas antes y después.
+
+`sim.js` reproduce a mano el bucle de `simStep`, porque no carga la capa de
+partida ni la interfaz. Si cambias el orden de `simStep`, cámbialo también en
+`tests/test_drive.js` o las dos cosas medirán cosas distintas.
 
 **Que la simulación ya corra headless es el activo más valioso del proyecto de
 cara al online**: el servidor autoritativo es ese mismo código.

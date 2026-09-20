@@ -3,15 +3,56 @@
 const TAU = Math.PI * 2;
 const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
 const lerp = (a, b, t) => a + (b - a) * t;
-const rnd = (a, b) => a + Math.random() * (b - a);
-const irnd = n => (Math.random() * n) | 0;
-const pickOne = arr => arr[irnd(arr.length)];
 const dist2 = (ax, az, bx, bz) => { const dx = ax - bx, dz = az - bz; return dx * dx + dz * dz; };
 const dist = (ax, az, bx, bz) => Math.sqrt(dist2(ax, az, bx, bz));
 const angDiff = (a, b) => { let d = (a - b) % TAU; if (d > Math.PI) d -= TAU; if (d < -Math.PI) d += TAU; return d; };
 const damp = (rate, dt) => 1 - Math.pow(rate, dt);
 const $ = id => document.getElementById(id);
 const el = (tag, cls, html) => { const e = document.createElement(tag); if (cls) e.className = cls; if (html != null) e.innerHTML = html; return e; };
+/* Punto plano, no THREE.Vector3: el estado de juego no debe depender de tipos
+   de la capa de render, y así se puede serializar con JSON.stringify. */
+const vec3 = (x, y, z) => ({ x: x || 0, y: y || 0, z: z || 0 });
+
+/* ============================ aleatoriedad ============================ */
+/* Dos generadores, deliberadamente separados.
+
+   srand() es determinista: misma semilla, misma partida. Es el único que puede
+   usarse dentro de la simulación, porque de él dependen la IA, la composición
+   de equipos y las reliquias que se ofrecen. El modo online necesita que el
+   servidor y el cliente saquen exactamente los mismos números.
+
+   frand() es cosmético: partículas, chispas, temblor de cámara, rocas de
+   ambiente. Da igual que dos máquinas difieran, porque nada de eso toca el
+   estado de juego.
+
+   Mezclarlos produce desincronizaciones que aparecen una vez cada cien
+   partidas y cuestan un día encontrar, así que `node tests/lint_rng.js` falla
+   si Math.random aparece fuera de las tres líneas marcadas abajo. */
+let _seed = 1;
+function seedSim(n) { _seed = (n >>> 0) || 1; }
+function simSeed() { return _seed; }
+function srand() {                                   // mulberry32
+  _seed = _seed + 0x6D2B79F5 | 0;
+  let t = Math.imul(_seed ^ _seed >>> 15, 1 | _seed);
+  t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+  return ((t ^ t >>> 14) >>> 0) / 4294967296;
+}
+const rnd = (a, b) => a + srand() * (b - a);
+const irnd = n => (srand() * n) | 0;
+const pickOne = arr => arr[irnd(arr.length)];
+const chance = p => srand() < p;
+
+const frand = () => Math.random();                   /* rng-cosmético */
+const frnd = (a, b) => a + Math.random() * (b - a);  /* rng-cosmético */
+const firnd = n => (Math.random() * n) | 0;          /* rng-cosmético */
+
+/* ============================ tiempo ============================ */
+/* La simulación avanza en pasos fijos de 1/60 s de tiempo de juego, pase lo
+   que pase con los fotogramas. Con paso variable el mismo combate daba
+   resultados distintos a 60 y a 144 Hz, y la predicción del modo online exige
+   que cliente y servidor lleguen al mismo estado con la misma entrada. */
+const STEP = 1 / 60;
+const MAX_STEPS = 5;   // techo por fotograma: tras un parón el tiempo se pierde
 
 /* ============================ arena ============================ */
 const ARENA = { hx: 19, hz: 13, r: 7.5, pillars: [] };
@@ -69,11 +110,14 @@ const G = {
   state: 'title',          // title | setup | intro | live | roundend | brite | result | pause
   mode: null, diff: null,
   fighters: [], projectiles: [], zones: [], pickups: [], fx: [],
+  byId: new Map(),         // uid -> luchador; las entidades se refieren por id
   player: null, t: 0, dt: 0, paused: false,
   round: 1, score: [0, 0], roundTime: 0, sudden: false, shrink: 1,
   picks: 0, timeScale: 1, nextOrb: 0, nextHeal: 0, started: false,
-  firstBlood: false, announceT: 0, camShake: 0, quality: 1, order: 0
+  firstBlood: false, announceT: 0, camShake: 0, quality: 1, order: 0,
+  seed: 0                  // semilla de la partida: basta para repetirla entera
 };
+const fighterById = id => G.byId.get(id) || null;
 
 /* El orden de actualización importa en el cuerpo a cuerpo: quien se procesa
    primero se adelanta siempre. Se rota cada fotograma para que nadie tenga
@@ -163,8 +207,8 @@ function floorTexture() {
   g.fillStyle = '#2b2f3c'; g.fillRect(0, 0, S, S);
   // veteado de piedra
   for (let i = 0; i < 2600; i++) {
-    const x = Math.random() * S, y = Math.random() * S, r = Math.random() * 46 + 6;
-    g.fillStyle = `rgba(${140 + irnd(50)},${138 + irnd(46)},${150 + irnd(50)},${0.018 + Math.random() * 0.04})`;
+    const x = frand() * S, y = frand() * S, r = frand() * 46 + 6;
+    g.fillStyle = `rgba(${140 + firnd(50)},${138 + firnd(46)},${150 + firnd(50)},${0.018 + frand() * 0.04})`;
     g.beginPath(); g.arc(x, y, r, 0, TAU); g.fill();
   }
   // losas
@@ -178,9 +222,9 @@ function floorTexture() {
   g.strokeStyle = 'rgba(6,8,12,.5)'; g.lineWidth = 2;
   for (let i = 0; i < 26; i++) {
     g.beginPath();
-    let x = Math.random() * S, y = Math.random() * S;
+    let x = frand() * S, y = frand() * S;
     g.moveTo(x, y);
-    for (let k = 0; k < 7; k++) { x += rnd(-70, 70); y += rnd(-70, 70); g.lineTo(x, y); }
+    for (let k = 0; k < 7; k++) { x += frnd(-70, 70); y += frnd(-70, 70); g.lineTo(x, y); }
     g.stroke();
   }
   // círculos centrales
@@ -271,11 +315,11 @@ function buildArena() {
   // rocas flotantes de ambiente
   const rock = new THREE.MeshStandardMaterial({ color: 0x1b2030, roughness: 1 });
   for (let i = 0; i < 14; i++) {
-    const s = rnd(1.2, 4.2);
+    const s = frnd(1.2, 4.2);
     const m = new THREE.Mesh(new THREE.DodecahedronGeometry(s, 0), rock);
-    const a = Math.random() * TAU, d = rnd(26, 48);
-    m.position.set(Math.cos(a) * d, rnd(-14, -3), Math.sin(a) * d * .8);
-    m.rotation.set(Math.random() * 3, Math.random() * 3, Math.random() * 3);
+    const a = frand() * TAU, d = frnd(26, 48);
+    m.position.set(Math.cos(a) * d, frnd(-14, -3), Math.sin(a) * d * .8);
+    m.rotation.set(frand() * 3, frand() * 3, frand() * 3);
     scene.add(m);
   }
 }
@@ -283,8 +327,8 @@ function buildArena() {
 function buildEmbers() {
   const N = 320, pos = new Float32Array(N * 3), spd = new Float32Array(N);
   for (let i = 0; i < N; i++) {
-    pos[i * 3] = rnd(-26, 26); pos[i * 3 + 1] = rnd(-6, 20); pos[i * 3 + 2] = rnd(-20, 20);
-    spd[i] = rnd(.5, 2.1);
+    pos[i * 3] = frnd(-26, 26); pos[i * 3 + 1] = frnd(-6, 20); pos[i * 3 + 2] = frnd(-20, 20);
+    spd[i] = frnd(.5, 2.1);
   }
   const g = new THREE.BufferGeometry();
   g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
@@ -297,7 +341,7 @@ function updateEmbers(dt) {
   const p = embers.geometry.attributes.position, spd = embers.userData.spd;
   for (let i = 0; i < spd.length; i++) {
     let y = p.getY(i) + spd[i] * dt;
-    if (y > 21) { y = -7; p.setX(i, rnd(-26, 26)); p.setZ(i, rnd(-20, 20)); }
+    if (y > 21) { y = -7; p.setX(i, frnd(-26, 26)); p.setZ(i, frnd(-20, 20)); }
     p.setY(i, y);
   }
   p.needsUpdate = true;
@@ -345,7 +389,7 @@ function updateCamera(dt) {
   if (G.camShake > 0) {
     G.camShake = Math.max(0, G.camShake - dt * 2.4);
     const s = G.camShake * G.camShake * 1.5;
-    CAM.shake.set(rnd(-s, s), rnd(-s, s), rnd(-s, s));
+    CAM.shake.set(frnd(-s, s), frnd(-s, s), frnd(-s, s));
   } else CAM.shake.set(0, 0, 0);
   camera.position.set(
     CAM.tgt.x + CAM.shake.x,
@@ -430,6 +474,54 @@ function moveInput() {
   return d > 0 ? { x: x / d, z: z / d } : { x: 0, z: 0 };
 }
 
+/* ---- comando de entrada ---- */
+/* La entrada entra en la simulación como un dato plano, nunca leyendo el
+   teclado desde dentro del bucle. Así se puede guardar, enviar por la red y
+   volver a aplicar, que es justo lo que hará la reconciliación del cliente
+   cuando exista el modo online; y de paso una repetición pasa a ser la semilla
+   más la lista de comandos.
+
+   Las direcciones van cuantizadas a 256 pasos (1,4°) y la distancia de
+   apuntado a decímetros: sobra para un proyectil de radio 0,3 a 26 m, y deja
+   el comando en 5 bytes más el número de secuencia. */
+const CMD_STILL = 255;                    // `move` cuando no te estás moviendo
+const BTN = { M1: 1, M2: 2, SP: 4, Q: 8, E: 16, F: 32, R: 64 };
+
+function dirToByte(x, z) { return ((Math.atan2(x, z) / TAU * 256 + 256.5) | 0) & 255; }
+function byteToDir(b, out) {
+  const a = b / 256 * TAU;
+  out.x = Math.sin(a); out.z = Math.cos(a);
+  return out;
+}
+
+function sampleInput(seq) {
+  updateAim();
+  const f = G.player;
+  const mv = moveInput();
+  const dx = Input.aim.x - (f ? f.pos.x : 0), dz = Input.aim.z - (f ? f.pos.z : 0);
+  let buttons = 0, ex = Input.shift || Input.exMode;
+  if (Input.queued) {
+    buttons |= 1 << Input.queued.i;
+    if (Input.queued.ex) ex = true;
+    Input.queued = null;
+    if (Input.exMode) { Input.exMode = false; syncEx(); }
+  }
+  if (Input.m1 || (Input.touch && Input.tFire)) buttons |= BTN.M1;
+  if (Input.m2) buttons |= BTN.M2;
+  if (Input.keys[' ']) buttons |= BTN.SP;
+  if (Input.keys['q']) buttons |= BTN.Q;
+  if (Input.keys['e']) buttons |= BTN.E;
+  if (Input.keys['f']) buttons |= BTN.F;
+  if (Input.keys['r']) buttons |= BTN.R;
+  return {
+    seq,
+    move: (mv.x || mv.z) ? dirToByte(mv.x, mv.z) : CMD_STILL,
+    aim: dirToByte(Input.aimDir.x, Input.aimDir.z),
+    aimD: clamp(Math.round(Math.hypot(dx, dz) * 10), 0, 255),
+    buttons, ex: ex ? 1 : 0
+  };
+}
+
 /* --- controles táctiles --- */
 function initTouch() {
   $('touch').classList.remove('hidden');
@@ -497,7 +589,7 @@ const SFX = {
     const n = Math.floor(this.ctx.sampleRate * dur);
     const buf = this.ctx.createBuffer(1, n, this.ctx.sampleRate);
     const d = buf.getChannelData(0);
-    for (let i = 0; i < n; i++) d[i] = (Math.random() * 2 - 1) * (1 - i / n);
+    for (let i = 0; i < n; i++) d[i] = (frand() * 2 - 1) * (1 - i / n);   /* ruido: presentación */
     const s = this.ctx.createBufferSource(); s.buffer = buf;
     const f = this.ctx.createBiquadFilter(); f.type = 'highpass'; f.frequency.value = hp || 600;
     const g = this.ctx.createGain(); g.gain.value = vol == null ? .3 : vol;

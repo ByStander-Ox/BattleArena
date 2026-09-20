@@ -1,23 +1,13 @@
 /* ============================ entrada del jugador ============================ */
+/* Muestrear y aplicar son dos pasos separados a propósito: entre medias hay un
+   comando, que es un dato plano. Hoy va directo del teclado a la simulación;
+   con el modo online irá además por la red y se volverá a aplicar al
+   reconciliar. */
+let _cmdSeq = 0;
 function playerControl() {
   const f = G.player;
   if (!f || !f.alive) return;
-  updateAim();
-  const mv = moveInput();
-  f.moveDir.x = mv.x; f.moveDir.z = mv.z;
-  f.aimDir.x = Input.aimDir.x; f.aimDir.z = Input.aimDir.z;
-  f.aimPt.set(Input.aim.x, 0, Input.aim.z);
-  if (G.state !== 'live') { f.moveDir.x = f.moveDir.z = 0; return; }
-
-  const ex = Input.shift || Input.exMode;
-  if (Input.queued) { tryCast(f, Input.queued.i, Input.queued.ex || Input.shift); Input.queued = null; if (Input.exMode) { Input.exMode = false; syncEx(); } }
-  if (Input.m1 || (Input.touch && Input.tFire)) tryCast(f, 0, false);
-  if (Input.m2) tryCast(f, 1, ex);
-  if (Input.keys[' ']) tryCast(f, 2, false);
-  if (Input.keys['q']) tryCast(f, 3, ex);
-  if (Input.keys['e']) tryCast(f, 4, ex);
-  if (Input.keys['f']) tryCast(f, 5, ex);
-  if (Input.keys['r']) tryCast(f, 6, false);
+  applyInput(f, sampleInput(_cmdSeq++));
 }
 
 /* ============================ ritmo de la ronda ============================ */
@@ -104,42 +94,59 @@ function updateRound(dt) {
   }
 }
 
+/* ============================ simulación ============================ */
+/* Un paso de simulación. Todo lo que cambia el estado de juego ocurre aquí y
+   solo aquí, siempre con el mismo dt. Lo que queda fuera es vista: se podría
+   quitar entero y la partida acabaría igual. */
+function simStep(dt) {
+  G.dt = dt;
+  // la posición del paso anterior sirve para dos cosas: estimar la velocidad
+  // (la usan los bots al predecir) e interpolar la vista entre pasos
+  for (const f of G.fighters) { f.px = f.pos.x; f.pz = f.pos.z; f.pface = f.face; }
+  for (const p of G.projectiles) { p.px = p.x; p.pz = p.z; }
+
+  playerControl();
+  G.order++;
+  const order = fightersInOrder();
+  if (G.state === 'live') {
+    for (const f of order) if (f.isBot && f.alive) updateAI(f, dt);
+  } else {
+    for (const f of G.fighters) { f.moveDir.x = 0; f.moveDir.z = 0; }
+  }
+  for (const f of order) tickFighter(f, dt);
+  updateProjectiles(dt);
+  updateZones(dt);
+  updatePickups(dt);
+  for (const f of G.fighters) {
+    f.velEst.x = (f.pos.x - f.px) / dt;
+    f.velEst.z = (f.pos.z - f.pz) / dt;
+  }
+  updateRound(dt);
+}
+
 /* ============================ bucle ============================ */
-let _last = 0;
+let _acc = 0;
 function frame() {
   requestAnimationFrame(frame);
-  const raw = Math.min(.05, clock.getDelta());
+  const raw = Math.min(.25, clock.getDelta());
   G.t += raw;
 
   const simState = G.state === 'intro' || G.state === 'live' || G.state === 'roundend';
-  if (G.started && !G.paused && simState) {
-    const dt = raw * (G.state === 'roundend' ? G.timeScale : 1);
-    G.dt = dt;
-    playerControl();
-    for (const f of G.fighters) {
-      f.velEst = f.velEst || { x: 0, z: 0 };
-      f._px = f._px === undefined ? f.pos.x : f._px;
-      f._pz = f._pz === undefined ? f.pos.z : f._pz;
-    }
-    G.order++;
-    const order = fightersInOrder();
-    if (G.state === 'live') {
-      for (const f of order) if (f.isBot && f.alive) updateAI(f, dt);
-    } else {
-      for (const f of G.fighters) { f.moveDir.x = 0; f.moveDir.z = 0; }
-    }
-    for (const f of order) tickFighter(f, dt);
-    updateProjectiles(dt);
-    updateZones(dt);
-    updatePickups(dt);
-    for (const f of G.fighters) {
-      f.velEst.x = (f.pos.x - f._px) / Math.max(dt, .001);
-      f.velEst.z = (f.pos.z - f._pz) / Math.max(dt, .001);
-      f._px = f.pos.x; f._pz = f.pos.z;
-      updateFighterVisual(f, dt);
-    }
-    updateRound(dt);
-    updateHUD(dt);
+  const simming = G.started && !G.paused && simState;
+  if (simming) {
+    // el acumulador recibe tiempo de juego, no real: la cámara lenta del
+    // remate de ronda da menos pasos, nunca pasos más cortos
+    _acc += raw * (G.state === 'roundend' ? G.timeScale : 1);
+    let n = 0;
+    while (_acc >= STEP && n < MAX_STEPS) { simStep(STEP); _acc -= STEP; n++; }
+    if (_acc >= STEP) _acc = 0;      // tras un parón el tiempo se pierde, no se recupera
+  } else _acc = 0;
+
+  const alpha = simming ? _acc / STEP : 1;
+  for (const f of G.fighters) updateFighterVisual(f, alpha);
+  updateProjectileVisual(alpha);
+  if (simming) {
+    updateHUD();
     updatePlates();
     if (G.announceT > 0) { G.announceT -= raw; if (G.announceT <= 0) clearAnnounce(); }
   }

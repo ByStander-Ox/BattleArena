@@ -4,7 +4,7 @@ const ROLE_RANGE = { 'Tirador': 8.6, 'Vanguardia': 2.5, 'Custodio': 7.4 };
 function makeAI(f, diffId) {
   f.ai = {
     d: DIFFS[diffId] || DIFFS.normal,
-    tgt: null, retgt: 0, think: 0, err: 0, strafe: Math.random() < .5 ? 1 : -1, strafeT: 0,
+    tgtId: 0, retgt: 0, think: 0, err: 0, strafe: chance(.5) ? 1 : -1, strafeT: 0,
     hold: 0, m1T: 0, panic: 0, want: { x: 0, z: 0 }
   };
 }
@@ -19,13 +19,15 @@ function alliesOf(f) { return G.fighters.filter(o => o.alive && o.team === f.tea
 function updateAI(f, dt) {
   const ai = f.ai, D = ai.d;
   ai.think -= dt; ai.strafeT -= dt; ai.retgt -= dt; ai.hold -= dt;
-  if (ai.strafeT <= 0) { ai.strafeT = rnd(.7, 1.9); if (Math.random() < .5) ai.strafe *= -1; }
+  if (ai.strafeT <= 0) { ai.strafeT = rnd(.7, 1.9); if (chance(.5)) ai.strafe *= -1; }
 
   const foes = enemiesOf(f);
   if (!foes.length) { f.moveDir.x = f.moveDir.z = 0; return; }
 
-  // objetivo
-  if (!ai.tgt || !ai.tgt.alive || ai.retgt <= 0) {
+  // objetivo: se guarda por id, no por referencia, para que el estado de la
+  // IA se pueda serializar y rebobinar igual que el resto de la simulación
+  let tgt = fighterById(ai.tgtId);
+  if (!tgt || !tgt.alive || ai.retgt <= 0) {
     ai.retgt = rnd(1.2, 2.4);
     let best = null, bs = -1e9;
     for (const e of foes) {
@@ -34,9 +36,10 @@ function updateAI(f, dt) {
       if (e === G.player) s += 1.5;
       if (s > bs) { bs = s; best = e; }
     }
-    ai.tgt = best;
+    tgt = best;
+    ai.tgtId = best ? best.uid : 0;
   }
-  const tgt = ai.tgt;
+  if (!tgt) { f.moveDir.x = f.moveDir.z = 0; return; }
   const d = dist(f.pos.x, f.pos.z, tgt.pos.x, tgt.pos.z);
   const want = ROLE_RANGE[f.champ.role] || 6;
 
@@ -52,7 +55,7 @@ function updateAI(f, dt) {
   const cur = Math.atan2(f.aimDir.x, f.aimDir.z);
   a = cur + angDiff(a, cur) * Math.min(1, dt * (6 + 16 * (1 - D.react)));
   f.aimDir.x = Math.sin(a); f.aimDir.z = Math.cos(a);
-  f.aimPt.set(lead.x, 0, lead.z);
+  f.aimPt.x = lead.x; f.aimPt.z = lead.z;
 
   // ---- vector de movimiento ----
   let mx = 0, mz = 0;
@@ -79,7 +82,7 @@ function updateAI(f, dt) {
     if (toX * p.dx + toZ * p.dz < 0) continue;              // ya pasó
     const cross = Math.abs(toX * p.dz - toZ * p.dx);
     if (cross > p.radius + 1.5) continue;
-    if (Math.random() > D.dodge) continue;
+    if (!chance(D.dodge)) continue;
     const side = (toX * p.dz - toZ * p.dx) >= 0 ? 1 : -1;
     dodging = { x: p.dz * side, z: -p.dx * side, urgency: 1 - rel / 11 };
     mx += dodging.x * 2.2; mz += dodging.z * 2.2;
@@ -136,7 +139,7 @@ function updateAI(f, dt) {
 }
 
 function wantEx(f, ctx, cost) {
-  return f.energy >= (cost || 50) + 8 && Math.random() < ctx.D.exUse;
+  return f.energy >= (cost || 50) + 8 && chance(ctx.D.exUse);
 }
 
 const BOT_PLANS = {
@@ -146,25 +149,25 @@ const BOT_PLANS = {
   vesk(f, c) {
     const { tgt, d, D } = c;
     // definitiva si el rival está controlado o cerca del centro
-    if (canCast(f, 6) && d < 14 && (tgt.st.stun > 0 || tgt.st.root > 0 || Math.random() < .5)) return { i: 6 };
+    if (canCast(f, 6) && d < 14 && (tgt.st.stun > 0 || tgt.st.root > 0 || chance(.5))) return { i: 6 };
     // patada: empujar al vacío si el borde está detrás del rival
     if (canCast(f, 5) && d < 3.3) {
       const bx = tgt.pos.x + (tgt.pos.x - f.pos.x), bz = tgt.pos.z + (tgt.pos.z - f.pos.z);
       const toEdge = edgeDepth(bx, bz, 1) < 1.4;
-      if (toEdge || tgt.hp / tgt.maxHp < .45 || Math.random() < .5) return { i: 5, ex: toEdge && wantEx(f, c, 50) };
+      if (toEdge || tgt.hp / tgt.maxHp < .45 || chance(.5)) return { i: 5, ex: toEdge && wantEx(f, c, 50) };
     }
     // humo para huir o correr
-    if (canCast(f, 4) && (c.lowHp < .45 || (d < 4 && Math.random() < .4))) return { i: 4, ex: c.lowHp < .3 && wantEx(f, c) };
+    if (canCast(f, 4) && (c.lowHp < .45 || (d < 4 && chance(.4)))) return { i: 4, ex: c.lowHp < .3 && wantEx(f, c) };
     // trampa delante del rival
-    if (canCast(f, 3) && d < 12 && Math.random() < .7) {
+    if (canCast(f, 3) && d < 12 && chance(.7)) {
       const p = predictPos(tgt, .55);
-      f.aimPt.set(p.x, 0, p.z);
+      f.aimPt.x = p.x; f.aimPt.z = p.z;
       return { i: 3, ex: wantEx(f, c) };
     }
     // saeta perforante si hay línea
     if (canCast(f, 1) && !c.blocked && d < 22) return { i: 1, ex: wantEx(f, c) };
     // rodar para separarse o esquivar
-    if (canCast(f, 2) && ((c.dodging && Math.random() < D.dodge) || (d < 3 && Math.random() < .5))) {
+    if (canCast(f, 2) && ((c.dodging && chance(D.dodge)) || (d < 3 && chance(.5)))) {
       const away = c.dodging || { x: (f.pos.x - tgt.pos.x), z: (f.pos.z - tgt.pos.z) };
       f.moveDir.x = away.x; f.moveDir.z = away.z;
       return { i: 2 };
@@ -206,16 +209,16 @@ const BOT_PLANS = {
       }
     }
     if (canCast(f, 4) && hurt && worst < .7) {                      // égida
-      f.aimPt.set(hurt.pos.x, 0, hurt.pos.z);
+      f.aimPt.x = hurt.pos.x; f.aimPt.z = hurt.pos.z;
       return { i: 4, ex: worst < .45 && wantEx(f, c) };
     }
     if (canCast(f, 3) && (worst < .8 || d < 9)) {                   // santuario
       const base = hurt && hurt !== f ? hurt.pos : f.pos;
-      f.aimPt.set(base.x, 0, base.z);
+      f.aimPt.x = base.x; f.aimPt.z = base.z;
       return { i: 3, ex: wantEx(f, c) };
     }
-    if (canCast(f, 5) && d < 14 && !c.blocked && Math.random() < .8) return { i: 5, ex: wantEx(f, c) };
-    if (canCast(f, 2) && d < 3.5 && Math.random() < .6) {
+    if (canCast(f, 5) && d < 14 && !c.blocked && chance(.8)) return { i: 5, ex: wantEx(f, c) };
+    if (canCast(f, 2) && d < 3.5 && chance(.6)) {
       f.moveDir.x = (f.pos.x - tgt.pos.x); f.moveDir.z = (f.pos.z - tgt.pos.z);
       return { i: 2 };
     }

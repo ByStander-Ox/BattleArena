@@ -7,7 +7,9 @@ function makeFighter(champId, team, isBot, name) {
   const C = CHAMPS[champId];
   const f = {
     uid: ++_uid, champ: C, team, isBot, name: name || C.name,
-    pos: new THREE.Vector3(0, 0, 0), face: 0, aimDir: { x: 0, z: team === 0 ? 1 : -1 }, aimPt: new THREE.Vector3(),
+    pos: vec3(0, 0, 0), face: 0, aimDir: { x: 0, z: team === 0 ? 1 : -1 }, aimPt: vec3(),
+    // posición del paso anterior: la usan velEst y la interpolación de la vista
+    px: 0, pz: 0, pface: 0, velEst: { x: 0, z: 0 }, lastHitById: 0,
     moveDir: { x: 0, z: 0 }, maxHp: C.hp, hp: C.hp, shield: 0, shieldT: 0, energy: 0, alive: true,
     cds: new Array(C.ab.length).fill(0), casting: null, combo: 0, comboT: 0, echoT: 0, deadT: 0,
     st: { stun: 0, root: 0, silence: 0, slow: 0, slowAmt: 0, haste: 0, hasteAmt: 0, invuln: 0, evade: 0, dr: 0, drAmt: 0, mark: 0, autoT: 0 },
@@ -36,6 +38,7 @@ function makeFighter(champId, team, isBot, name) {
   g.userData = { body, ring, base: body.scale.x || 1 };
   f.mesh = g;
   scene.add(g);
+  G.byId.set(f.uid, f);
   return f;
 }
 
@@ -49,9 +52,14 @@ function resetFighter(f, x, z, faceDir) {
   f.energy = Math.min(100, f.mods.startEnergy);
   f.cds.fill(0); f.casting = null; f.combo = 0; f.dash = null; f.falling = 0;
   f.knock.x = f.knock.z = f.knock.t = 0;
+  f.lastHitById = 0;
   for (const k in f.st) f.st[k] = 0;
   for (const k in f.ccDR) { f.ccDR[k].n = 0; f.ccDR[k].t = 0; }
-  f.pos.set(x, 0, z);
+  f.pos.x = x; f.pos.y = 0; f.pos.z = z;
+  // reaparecer es un salto, no un movimiento: que ni velEst ni la vista
+  // interpolen desde donde estabas al morir
+  f.px = x; f.pz = z; f.pface = faceDir;
+  f.velEst.x = 0; f.velEst.z = 0;
   f.face = faceDir; f.aimDir.x = Math.sin(faceDir); f.aimDir.z = Math.cos(faceDir);
   f.mesh.visible = true;
   f.mesh.position.set(x, 0, z);
@@ -59,8 +67,8 @@ function resetFighter(f, x, z, faceDir) {
   f.mesh.scale.setScalar(1);
   if (f.mods.autoShield) f.st.autoT = f.mods.autoShield;
   if (f.ai) {                       // que los bots no reaccionen todos en el mismo fotograma
-    f.ai.hold = rnd(.1, .8); f.ai.think = rnd(0, .3); f.ai.tgt = null;
-    f.ai.strafe = Math.random() < .5 ? 1 : -1; f.ai.panic = 0;
+    f.ai.hold = rnd(.1, .8); f.ai.think = rnd(0, .3); f.ai.tgtId = 0;
+    f.ai.strafe = chance(.5) ? 1 : -1; f.ai.panic = 0;
   }
 }
 
@@ -184,11 +192,12 @@ function shoot(f, o) {
   scene.add(mesh);
   const light = null;
   G.projectiles.push({
-    x: mesh.position.x, z: mesh.position.z, dx: d.x / len, dz: d.z / len,
+    x: mesh.position.x, z: mesh.position.z, px: mesh.position.x, pz: mesh.position.z,
+    dx: d.x / len, dz: d.z / len,
     speed: o.speed, radius: o.radius, range: o.range, traveled: 0,
     dmg: o.dmg || 0, healAlly: o.healAlly || 0, kb: o.kb || 0, pull: o.pull || 0,
     cc: o.cc, ccT: o.ccT || 0, cc2: o.cc2, cc2T: o.cc2T || 0,
-    pierce: !!o.pierce, chain: !!o.chain, team: f.team, owner: f, hit: [], mesh, light, alive: true, col
+    pierce: !!o.pierce, chain: !!o.chain, team: f.team, ownerId: f.uid, hit: [], mesh, light, alive: true, col
   });
 }
 
@@ -267,7 +276,7 @@ function spawnZone(f, o) {
     x: o.x, z: o.z, radius: o.radius, dur: o.dur, t: 0, delay: o.delay || 0,
     tick: o.tick || 0, tickT: 0, tickDmg: o.tickDmg || 0, tickHeal: o.tickHeal || 0,
     dmg: o.dmg || 0, cc: o.cc, ccT: o.ccT || 0, slow: o.slow || 0, trap: !!o.trap,
-    friendly: !!o.friendly, rain: !!o.rain, team: f.team, owner: f, mesh, ring, alive: true, col
+    friendly: !!o.friendly, rain: !!o.rain, team: f.team, ownerId: f.uid, mesh, ring, alive: true, col
   });
 }
 
@@ -327,7 +336,7 @@ function tryCast(f, i, ex) {
   if (ex) spent += ab.exCost;
   f.energy -= spent;
   const aim = { x: f.aimDir.x, z: f.aimDir.z };
-  let pt = new THREE.Vector3(f.aimPt.x, 0, f.aimPt.z);
+  let pt = vec3(f.aimPt.x, 0, f.aimPt.z);
   if (ab.ground) {
     const dx = pt.x - f.pos.x, dz = pt.z - f.pos.z, d = Math.hypot(dx, dz);
     if (d > ab.ground) { pt.x = f.pos.x + dx / d * ab.ground; pt.z = f.pos.z + dz / d * ab.ground; }
@@ -348,6 +357,30 @@ function fireAbility(f, i, ab, o) {
   f.anim = .22;
   ab.act(f, o);
   if (i === 0 && ab.combo) { f.combo = (f.combo + 1) % ab.combo; f.comboT = 1.4; }
+}
+
+/* Aplica un comando de entrada a un luchador. Es el gemelo exacto de
+   updateAI: ambos dejan al luchador con un moveDir, un aimDir y, como mucho,
+   una habilidad intentada. Nadie más escribe esas intenciones, y por eso un
+   bot puede sustituir a un humano sin que nada más cambie. */
+const _cmdDir = { x: 0, z: 0 };
+function applyInput(f, cmd) {
+  if (cmd.move === CMD_STILL) { f.moveDir.x = 0; f.moveDir.z = 0; }
+  else { byteToDir(cmd.move, _cmdDir); f.moveDir.x = _cmdDir.x; f.moveDir.z = _cmdDir.z; }
+  byteToDir(cmd.aim, _cmdDir);
+  f.aimDir.x = _cmdDir.x; f.aimDir.z = _cmdDir.z;
+  const d = cmd.aimD / 10;
+  f.aimPt.x = f.pos.x + _cmdDir.x * d;
+  f.aimPt.z = f.pos.z + _cmdDir.z * d;
+  if (G.state !== 'live') { f.moveDir.x = f.moveDir.z = 0; return; }
+  const b = cmd.buttons, ex = !!cmd.ex;
+  if (b & BTN.M1) tryCast(f, 0, false);
+  if (b & BTN.M2) tryCast(f, 1, ex);
+  if (b & BTN.SP) tryCast(f, 2, false);
+  if (b & BTN.Q) tryCast(f, 3, ex);
+  if (b & BTN.E) tryCast(f, 4, ex);
+  if (b & BTN.F) tryCast(f, 5, ex);
+  if (b & BTN.R) tryCast(f, 6, false);
 }
 
 /* ============================ tick de luchador ============================ */
@@ -382,7 +415,7 @@ function tickFighter(f, dt) {
     f.falling += dt;
     f.mesh.position.y -= dt * 14;
     f.mesh.rotation.z += dt * 3;
-    if (f.falling > .55) { killFighter(f, f.lastHitBy); f.mesh.visible = false; }
+    if (f.falling > .55) { killFighter(f, fighterById(f.lastHitById)); f.mesh.visible = false; }
     return;
   }
 
@@ -410,15 +443,15 @@ function tickFighter(f, dt) {
     f.pos.x += d.dx * step; f.pos.z += d.dz * step;
     if (collidePillars(f.pos, .5)) d.t = d.dur;
     pushInside(f.pos, .5);
-    if (d.trail && Math.random() < .5) puff(f.pos, d.trail, 2, .5);
+    if (d.trail && frand() < .5) puff(f.pos, d.trail, 2, .5);   // estela: presentación
     if (d.dmg || d.cc) {
       for (const t of G.fighters) {
-        if (t.team === f.team || !t.alive || d.hit.indexOf(t) >= 0) continue;
+        if (t.team === f.team || !t.alive || d.hit.indexOf(t.uid) >= 0) continue;
         if (dist(t.pos.x, t.pos.z, f.pos.x, f.pos.z) > 1.15) continue;
-        d.hit.push(t);
+        d.hit.push(t.uid);
         if (d.dmg) dealDamage(f, t, d.dmg);
         if (d.cc) applyCC(t, d.cc, d.ccT);
-        t.lastHitBy = f;
+        t.lastHitById = f.uid;
         if (d.stopOnHit) d.t = d.dur;
       }
     }
@@ -458,12 +491,17 @@ function tickFighter(f, dt) {
   }
 }
 
-function updateFighterVisual(f, dt) {
+/* La simulación avanza a saltos fijos de 1/60 s; `alpha` dice qué fracción del
+   siguiente paso lleva acumulada el fotograma actual. Interpolar entre la
+   posición anterior y la nueva es lo que mantiene el movimiento suave también
+   a 120 o 144 Hz, donde un paso fijo sin interpolar se vería a tirones. */
+function updateFighterVisual(f, alpha) {
   if (!f.alive || f.falling) return;
   const m = f.mesh;
-  m.position.x = f.pos.x; m.position.z = f.pos.z;
+  m.position.x = lerp(f.px, f.pos.x, alpha);
+  m.position.z = lerp(f.pz, f.pos.z, alpha);
   m.position.y = Math.abs(Math.sin(f.bob)) * .06 + (f.anim > 0 ? .1 : 0);
-  m.rotation.y = f.face;
+  m.rotation.y = f.pface + angDiff(f.face, f.pface) * alpha;
   const b = m.userData.body;
   const base = m.userData.base;
   const pulse = f.anim > 0 ? 1 + f.anim * .5 : 1;
@@ -491,25 +529,25 @@ function updateProjectiles(dt) {
     // pilares
     if (segHitsPillar(p.x, p.z, nx, nz, p.radius * .5)) { destroyProj(p, i, true); continue; }
     p.x = nx; p.z = nz;
-    p.mesh.position.set(p.x, 1.0, p.z);
     if (p.traveled > p.range || !insideArena(p.x, p.z, -1.5, 1)) { destroyProj(p, i, false); continue; }
+    const owner = fighterById(p.ownerId);
     let consumed = false;
     for (const t of G.fighters) {
-      if (!t.alive || t.falling || p.hit.indexOf(t) >= 0) continue;
+      if (!t.alive || t.falling || p.hit.indexOf(t.uid) >= 0) continue;
       const friendly = t.team === p.team;
       if (friendly && !p.healAlly) continue;
       if (dist(t.pos.x, t.pos.z, p.x, p.z) > p.radius + .55) continue;
-      p.hit.push(t);
+      p.hit.push(t.uid);
       if (friendly) {
-        healTarget(p.owner, t, p.healAlly);
+        healTarget(owner, t, p.healAlly);
       } else {
         if (t.st.evade > 0) { t.st.evade = 0; floatNum(t.pos, 'Evadido', 'en'); continue; }
-        dealDamage(p.owner, t, p.dmg);
-        t.lastHitBy = p.owner;
+        dealDamage(owner, t, p.dmg);
+        t.lastHitById = p.ownerId;
         if (p.cc) applyCC(t, p.cc, p.ccT);
         if (p.cc2) applyCC(t, p.cc2, p.cc2T);
-        if (p.pull) {
-          const dx = p.owner.pos.x - t.pos.x, dz = p.owner.pos.z - t.pos.z;
+        if (p.pull && owner) {
+          const dx = owner.pos.x - t.pos.x, dz = owner.pos.z - t.pos.z;
           applyKnockback(t, dx, dz, Math.max(0, Math.hypot(dx, dz) - 2) * 4.2);
         } else if (p.kb) applyKnockback(t, p.dx, p.dz, p.kb);
       }
@@ -518,6 +556,9 @@ function updateProjectiles(dt) {
     }
     if (consumed) destroyProj(p, i, true);
   }
+}
+function updateProjectileVisual(alpha) {
+  for (const p of G.projectiles) p.mesh.position.set(lerp(p.px, p.x, alpha), 1.0, lerp(p.pz, p.z, alpha));
 }
 function destroyProj(p, i, fx) {
   if (fx) hitFx(p.x, p.z, p.col);
@@ -538,15 +579,16 @@ function updateZones(dt) {
     z.t += dt;
     z.ring.rotation.y += dt * .6;
     z.mesh.material.opacity = .13 + Math.sin(G.t * 3) * .03;
-    if (z.rain && Math.random() < dt * 40) {
-      const a = Math.random() * TAU, r = Math.sqrt(Math.random()) * z.radius;
+    if (z.rain && frand() < dt * 40) {                // solo lluvia visible
+      const a = frand() * TAU, r = Math.sqrt(frand()) * z.radius;
       rainFx(z.x + Math.cos(a) * r, z.z + Math.sin(a) * r, z.col);
     }
+    const owner = fighterById(z.ownerId);
     if (z.trap) {
       for (const t of G.fighters) {
         if (t.team === z.team || !t.alive) continue;
         if (dist(t.pos.x, t.pos.z, z.x, z.z) > z.radius) continue;
-        dealDamage(z.owner, t, z.dmg);
+        dealDamage(owner, t, z.dmg);
         applyCC(t, z.cc, z.ccT);
         ringFx({ x: z.x, y: 0, z: z.z }, z.radius, z.col);
         z.t = z.dur + 1;
@@ -560,8 +602,8 @@ function updateZones(dt) {
           for (const t of G.fighters) {
             if (!t.alive) continue;
             if (dist(t.pos.x, t.pos.z, z.x, z.z) > z.radius) continue;
-            if (t.team === z.team) { if (z.tickHeal) healTarget(z.owner, t, z.tickHeal); }
-            else if (z.tickDmg) { dealDamage(z.owner, t, z.tickDmg); t.lastHitBy = z.owner; }
+            if (t.team === z.team) { if (z.tickHeal) healTarget(owner, t, z.tickHeal); }
+            else if (z.tickDmg) { dealDamage(owner, t, z.tickDmg); t.lastHitById = z.ownerId; }
           }
         }
       }
@@ -625,10 +667,10 @@ function clearPickups() {
 /* ============================ efectos ============================ */
 function puff(pos, col, n, scale) {
   for (let i = 0; i < n; i++) {
-    const m = new THREE.Mesh(new THREE.SphereGeometry((scale || 1) * rnd(.08, .2), 6, 5), new THREE.MeshBasicMaterial({ color: col, transparent: true, opacity: .9 }));
-    m.position.set(pos.x + rnd(-.4, .4), (pos.y || 0) + rnd(.3, 1.5), pos.z + rnd(-.4, .4));
+    const m = new THREE.Mesh(new THREE.SphereGeometry((scale || 1) * frnd(.08, .2), 6, 5), new THREE.MeshBasicMaterial({ color: col, transparent: true, opacity: .9 }));
+    m.position.set(pos.x + frnd(-.4, .4), (pos.y || 0) + frnd(.3, 1.5), pos.z + frnd(-.4, .4));
     scene.add(m);
-    G.fx.push({ mesh: m, t: 0, dur: rnd(.3, .7), vy: rnd(1, 4), vx: rnd(-2.5, 2.5), vz: rnd(-2.5, 2.5), kind: 'puff' });
+    G.fx.push({ mesh: m, t: 0, dur: frnd(.3, .7), vy: frnd(1, 4), vx: frnd(-2.5, 2.5), vz: frnd(-2.5, 2.5), kind: 'puff' });
   }
 }
 function hitFx(x, z, col) {

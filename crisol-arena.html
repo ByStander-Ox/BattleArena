@@ -337,15 +337,56 @@ table.score tr.me td{background:rgba(44,36,14,.75)}
 const TAU = Math.PI * 2;
 const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
 const lerp = (a, b, t) => a + (b - a) * t;
-const rnd = (a, b) => a + Math.random() * (b - a);
-const irnd = n => (Math.random() * n) | 0;
-const pickOne = arr => arr[irnd(arr.length)];
 const dist2 = (ax, az, bx, bz) => { const dx = ax - bx, dz = az - bz; return dx * dx + dz * dz; };
 const dist = (ax, az, bx, bz) => Math.sqrt(dist2(ax, az, bx, bz));
 const angDiff = (a, b) => { let d = (a - b) % TAU; if (d > Math.PI) d -= TAU; if (d < -Math.PI) d += TAU; return d; };
 const damp = (rate, dt) => 1 - Math.pow(rate, dt);
 const $ = id => document.getElementById(id);
 const el = (tag, cls, html) => { const e = document.createElement(tag); if (cls) e.className = cls; if (html != null) e.innerHTML = html; return e; };
+/* Punto plano, no THREE.Vector3: el estado de juego no debe depender de tipos
+   de la capa de render, y así se puede serializar con JSON.stringify. */
+const vec3 = (x, y, z) => ({ x: x || 0, y: y || 0, z: z || 0 });
+
+/* ============================ aleatoriedad ============================ */
+/* Dos generadores, deliberadamente separados.
+
+   srand() es determinista: misma semilla, misma partida. Es el único que puede
+   usarse dentro de la simulación, porque de él dependen la IA, la composición
+   de equipos y las reliquias que se ofrecen. El modo online necesita que el
+   servidor y el cliente saquen exactamente los mismos números.
+
+   frand() es cosmético: partículas, chispas, temblor de cámara, rocas de
+   ambiente. Da igual que dos máquinas difieran, porque nada de eso toca el
+   estado de juego.
+
+   Mezclarlos produce desincronizaciones que aparecen una vez cada cien
+   partidas y cuestan un día encontrar, así que `node tests/lint_rng.js` falla
+   si Math.random aparece fuera de las tres líneas marcadas abajo. */
+let _seed = 1;
+function seedSim(n) { _seed = (n >>> 0) || 1; }
+function simSeed() { return _seed; }
+function srand() {                                   // mulberry32
+  _seed = _seed + 0x6D2B79F5 | 0;
+  let t = Math.imul(_seed ^ _seed >>> 15, 1 | _seed);
+  t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+  return ((t ^ t >>> 14) >>> 0) / 4294967296;
+}
+const rnd = (a, b) => a + srand() * (b - a);
+const irnd = n => (srand() * n) | 0;
+const pickOne = arr => arr[irnd(arr.length)];
+const chance = p => srand() < p;
+
+const frand = () => Math.random();                   /* rng-cosmético */
+const frnd = (a, b) => a + Math.random() * (b - a);  /* rng-cosmético */
+const firnd = n => (Math.random() * n) | 0;          /* rng-cosmético */
+
+/* ============================ tiempo ============================ */
+/* La simulación avanza en pasos fijos de 1/60 s de tiempo de juego, pase lo
+   que pase con los fotogramas. Con paso variable el mismo combate daba
+   resultados distintos a 60 y a 144 Hz, y la predicción del modo online exige
+   que cliente y servidor lleguen al mismo estado con la misma entrada. */
+const STEP = 1 / 60;
+const MAX_STEPS = 5;   // techo por fotograma: tras un parón el tiempo se pierde
 
 /* ============================ arena ============================ */
 const ARENA = { hx: 19, hz: 13, r: 7.5, pillars: [] };
@@ -403,11 +444,14 @@ const G = {
   state: 'title',          // title | setup | intro | live | roundend | brite | result | pause
   mode: null, diff: null,
   fighters: [], projectiles: [], zones: [], pickups: [], fx: [],
+  byId: new Map(),         // uid -> luchador; las entidades se refieren por id
   player: null, t: 0, dt: 0, paused: false,
   round: 1, score: [0, 0], roundTime: 0, sudden: false, shrink: 1,
   picks: 0, timeScale: 1, nextOrb: 0, nextHeal: 0, started: false,
-  firstBlood: false, announceT: 0, camShake: 0, quality: 1, order: 0
+  firstBlood: false, announceT: 0, camShake: 0, quality: 1, order: 0,
+  seed: 0                  // semilla de la partida: basta para repetirla entera
 };
+const fighterById = id => G.byId.get(id) || null;
 
 /* El orden de actualización importa en el cuerpo a cuerpo: quien se procesa
    primero se adelanta siempre. Se rota cada fotograma para que nadie tenga
@@ -497,8 +541,8 @@ function floorTexture() {
   g.fillStyle = '#2b2f3c'; g.fillRect(0, 0, S, S);
   // veteado de piedra
   for (let i = 0; i < 2600; i++) {
-    const x = Math.random() * S, y = Math.random() * S, r = Math.random() * 46 + 6;
-    g.fillStyle = `rgba(${140 + irnd(50)},${138 + irnd(46)},${150 + irnd(50)},${0.018 + Math.random() * 0.04})`;
+    const x = frand() * S, y = frand() * S, r = frand() * 46 + 6;
+    g.fillStyle = `rgba(${140 + firnd(50)},${138 + firnd(46)},${150 + firnd(50)},${0.018 + frand() * 0.04})`;
     g.beginPath(); g.arc(x, y, r, 0, TAU); g.fill();
   }
   // losas
@@ -512,9 +556,9 @@ function floorTexture() {
   g.strokeStyle = 'rgba(6,8,12,.5)'; g.lineWidth = 2;
   for (let i = 0; i < 26; i++) {
     g.beginPath();
-    let x = Math.random() * S, y = Math.random() * S;
+    let x = frand() * S, y = frand() * S;
     g.moveTo(x, y);
-    for (let k = 0; k < 7; k++) { x += rnd(-70, 70); y += rnd(-70, 70); g.lineTo(x, y); }
+    for (let k = 0; k < 7; k++) { x += frnd(-70, 70); y += frnd(-70, 70); g.lineTo(x, y); }
     g.stroke();
   }
   // círculos centrales
@@ -605,11 +649,11 @@ function buildArena() {
   // rocas flotantes de ambiente
   const rock = new THREE.MeshStandardMaterial({ color: 0x1b2030, roughness: 1 });
   for (let i = 0; i < 14; i++) {
-    const s = rnd(1.2, 4.2);
+    const s = frnd(1.2, 4.2);
     const m = new THREE.Mesh(new THREE.DodecahedronGeometry(s, 0), rock);
-    const a = Math.random() * TAU, d = rnd(26, 48);
-    m.position.set(Math.cos(a) * d, rnd(-14, -3), Math.sin(a) * d * .8);
-    m.rotation.set(Math.random() * 3, Math.random() * 3, Math.random() * 3);
+    const a = frand() * TAU, d = frnd(26, 48);
+    m.position.set(Math.cos(a) * d, frnd(-14, -3), Math.sin(a) * d * .8);
+    m.rotation.set(frand() * 3, frand() * 3, frand() * 3);
     scene.add(m);
   }
 }
@@ -617,8 +661,8 @@ function buildArena() {
 function buildEmbers() {
   const N = 320, pos = new Float32Array(N * 3), spd = new Float32Array(N);
   for (let i = 0; i < N; i++) {
-    pos[i * 3] = rnd(-26, 26); pos[i * 3 + 1] = rnd(-6, 20); pos[i * 3 + 2] = rnd(-20, 20);
-    spd[i] = rnd(.5, 2.1);
+    pos[i * 3] = frnd(-26, 26); pos[i * 3 + 1] = frnd(-6, 20); pos[i * 3 + 2] = frnd(-20, 20);
+    spd[i] = frnd(.5, 2.1);
   }
   const g = new THREE.BufferGeometry();
   g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
@@ -631,7 +675,7 @@ function updateEmbers(dt) {
   const p = embers.geometry.attributes.position, spd = embers.userData.spd;
   for (let i = 0; i < spd.length; i++) {
     let y = p.getY(i) + spd[i] * dt;
-    if (y > 21) { y = -7; p.setX(i, rnd(-26, 26)); p.setZ(i, rnd(-20, 20)); }
+    if (y > 21) { y = -7; p.setX(i, frnd(-26, 26)); p.setZ(i, frnd(-20, 20)); }
     p.setY(i, y);
   }
   p.needsUpdate = true;
@@ -679,7 +723,7 @@ function updateCamera(dt) {
   if (G.camShake > 0) {
     G.camShake = Math.max(0, G.camShake - dt * 2.4);
     const s = G.camShake * G.camShake * 1.5;
-    CAM.shake.set(rnd(-s, s), rnd(-s, s), rnd(-s, s));
+    CAM.shake.set(frnd(-s, s), frnd(-s, s), frnd(-s, s));
   } else CAM.shake.set(0, 0, 0);
   camera.position.set(
     CAM.tgt.x + CAM.shake.x,
@@ -764,6 +808,54 @@ function moveInput() {
   return d > 0 ? { x: x / d, z: z / d } : { x: 0, z: 0 };
 }
 
+/* ---- comando de entrada ---- */
+/* La entrada entra en la simulación como un dato plano, nunca leyendo el
+   teclado desde dentro del bucle. Así se puede guardar, enviar por la red y
+   volver a aplicar, que es justo lo que hará la reconciliación del cliente
+   cuando exista el modo online; y de paso una repetición pasa a ser la semilla
+   más la lista de comandos.
+
+   Las direcciones van cuantizadas a 256 pasos (1,4°) y la distancia de
+   apuntado a decímetros: sobra para un proyectil de radio 0,3 a 26 m, y deja
+   el comando en 5 bytes más el número de secuencia. */
+const CMD_STILL = 255;                    // `move` cuando no te estás moviendo
+const BTN = { M1: 1, M2: 2, SP: 4, Q: 8, E: 16, F: 32, R: 64 };
+
+function dirToByte(x, z) { return ((Math.atan2(x, z) / TAU * 256 + 256.5) | 0) & 255; }
+function byteToDir(b, out) {
+  const a = b / 256 * TAU;
+  out.x = Math.sin(a); out.z = Math.cos(a);
+  return out;
+}
+
+function sampleInput(seq) {
+  updateAim();
+  const f = G.player;
+  const mv = moveInput();
+  const dx = Input.aim.x - (f ? f.pos.x : 0), dz = Input.aim.z - (f ? f.pos.z : 0);
+  let buttons = 0, ex = Input.shift || Input.exMode;
+  if (Input.queued) {
+    buttons |= 1 << Input.queued.i;
+    if (Input.queued.ex) ex = true;
+    Input.queued = null;
+    if (Input.exMode) { Input.exMode = false; syncEx(); }
+  }
+  if (Input.m1 || (Input.touch && Input.tFire)) buttons |= BTN.M1;
+  if (Input.m2) buttons |= BTN.M2;
+  if (Input.keys[' ']) buttons |= BTN.SP;
+  if (Input.keys['q']) buttons |= BTN.Q;
+  if (Input.keys['e']) buttons |= BTN.E;
+  if (Input.keys['f']) buttons |= BTN.F;
+  if (Input.keys['r']) buttons |= BTN.R;
+  return {
+    seq,
+    move: (mv.x || mv.z) ? dirToByte(mv.x, mv.z) : CMD_STILL,
+    aim: dirToByte(Input.aimDir.x, Input.aimDir.z),
+    aimD: clamp(Math.round(Math.hypot(dx, dz) * 10), 0, 255),
+    buttons, ex: ex ? 1 : 0
+  };
+}
+
 /* --- controles táctiles --- */
 function initTouch() {
   $('touch').classList.remove('hidden');
@@ -831,7 +923,7 @@ const SFX = {
     const n = Math.floor(this.ctx.sampleRate * dur);
     const buf = this.ctx.createBuffer(1, n, this.ctx.sampleRate);
     const d = buf.getChannelData(0);
-    for (let i = 0; i < n; i++) d[i] = (Math.random() * 2 - 1) * (1 - i / n);
+    for (let i = 0; i < n; i++) d[i] = (frand() * 2 - 1) * (1 - i / n);   /* ruido: presentación */
     const s = this.ctx.createBufferSource(); s.buffer = buf;
     const f = this.ctx.createBiquadFilter(); f.type = 'highpass'; f.frequency.value = hp || 600;
     const g = this.ctx.createGain(); g.gain.value = vol == null ? .3 : vol;
@@ -1162,7 +1254,9 @@ function makeFighter(champId, team, isBot, name) {
   const C = CHAMPS[champId];
   const f = {
     uid: ++_uid, champ: C, team, isBot, name: name || C.name,
-    pos: new THREE.Vector3(0, 0, 0), face: 0, aimDir: { x: 0, z: team === 0 ? 1 : -1 }, aimPt: new THREE.Vector3(),
+    pos: vec3(0, 0, 0), face: 0, aimDir: { x: 0, z: team === 0 ? 1 : -1 }, aimPt: vec3(),
+    // posición del paso anterior: la usan velEst y la interpolación de la vista
+    px: 0, pz: 0, pface: 0, velEst: { x: 0, z: 0 }, lastHitById: 0,
     moveDir: { x: 0, z: 0 }, maxHp: C.hp, hp: C.hp, shield: 0, shieldT: 0, energy: 0, alive: true,
     cds: new Array(C.ab.length).fill(0), casting: null, combo: 0, comboT: 0, echoT: 0, deadT: 0,
     st: { stun: 0, root: 0, silence: 0, slow: 0, slowAmt: 0, haste: 0, hasteAmt: 0, invuln: 0, evade: 0, dr: 0, drAmt: 0, mark: 0, autoT: 0 },
@@ -1191,6 +1285,7 @@ function makeFighter(champId, team, isBot, name) {
   g.userData = { body, ring, base: body.scale.x || 1 };
   f.mesh = g;
   scene.add(g);
+  G.byId.set(f.uid, f);
   return f;
 }
 
@@ -1204,9 +1299,14 @@ function resetFighter(f, x, z, faceDir) {
   f.energy = Math.min(100, f.mods.startEnergy);
   f.cds.fill(0); f.casting = null; f.combo = 0; f.dash = null; f.falling = 0;
   f.knock.x = f.knock.z = f.knock.t = 0;
+  f.lastHitById = 0;
   for (const k in f.st) f.st[k] = 0;
   for (const k in f.ccDR) { f.ccDR[k].n = 0; f.ccDR[k].t = 0; }
-  f.pos.set(x, 0, z);
+  f.pos.x = x; f.pos.y = 0; f.pos.z = z;
+  // reaparecer es un salto, no un movimiento: que ni velEst ni la vista
+  // interpolen desde donde estabas al morir
+  f.px = x; f.pz = z; f.pface = faceDir;
+  f.velEst.x = 0; f.velEst.z = 0;
   f.face = faceDir; f.aimDir.x = Math.sin(faceDir); f.aimDir.z = Math.cos(faceDir);
   f.mesh.visible = true;
   f.mesh.position.set(x, 0, z);
@@ -1214,8 +1314,8 @@ function resetFighter(f, x, z, faceDir) {
   f.mesh.scale.setScalar(1);
   if (f.mods.autoShield) f.st.autoT = f.mods.autoShield;
   if (f.ai) {                       // que los bots no reaccionen todos en el mismo fotograma
-    f.ai.hold = rnd(.1, .8); f.ai.think = rnd(0, .3); f.ai.tgt = null;
-    f.ai.strafe = Math.random() < .5 ? 1 : -1; f.ai.panic = 0;
+    f.ai.hold = rnd(.1, .8); f.ai.think = rnd(0, .3); f.ai.tgtId = 0;
+    f.ai.strafe = chance(.5) ? 1 : -1; f.ai.panic = 0;
   }
 }
 
@@ -1339,11 +1439,12 @@ function shoot(f, o) {
   scene.add(mesh);
   const light = null;
   G.projectiles.push({
-    x: mesh.position.x, z: mesh.position.z, dx: d.x / len, dz: d.z / len,
+    x: mesh.position.x, z: mesh.position.z, px: mesh.position.x, pz: mesh.position.z,
+    dx: d.x / len, dz: d.z / len,
     speed: o.speed, radius: o.radius, range: o.range, traveled: 0,
     dmg: o.dmg || 0, healAlly: o.healAlly || 0, kb: o.kb || 0, pull: o.pull || 0,
     cc: o.cc, ccT: o.ccT || 0, cc2: o.cc2, cc2T: o.cc2T || 0,
-    pierce: !!o.pierce, chain: !!o.chain, team: f.team, owner: f, hit: [], mesh, light, alive: true, col
+    pierce: !!o.pierce, chain: !!o.chain, team: f.team, ownerId: f.uid, hit: [], mesh, light, alive: true, col
   });
 }
 
@@ -1422,7 +1523,7 @@ function spawnZone(f, o) {
     x: o.x, z: o.z, radius: o.radius, dur: o.dur, t: 0, delay: o.delay || 0,
     tick: o.tick || 0, tickT: 0, tickDmg: o.tickDmg || 0, tickHeal: o.tickHeal || 0,
     dmg: o.dmg || 0, cc: o.cc, ccT: o.ccT || 0, slow: o.slow || 0, trap: !!o.trap,
-    friendly: !!o.friendly, rain: !!o.rain, team: f.team, owner: f, mesh, ring, alive: true, col
+    friendly: !!o.friendly, rain: !!o.rain, team: f.team, ownerId: f.uid, mesh, ring, alive: true, col
   });
 }
 
@@ -1482,7 +1583,7 @@ function tryCast(f, i, ex) {
   if (ex) spent += ab.exCost;
   f.energy -= spent;
   const aim = { x: f.aimDir.x, z: f.aimDir.z };
-  let pt = new THREE.Vector3(f.aimPt.x, 0, f.aimPt.z);
+  let pt = vec3(f.aimPt.x, 0, f.aimPt.z);
   if (ab.ground) {
     const dx = pt.x - f.pos.x, dz = pt.z - f.pos.z, d = Math.hypot(dx, dz);
     if (d > ab.ground) { pt.x = f.pos.x + dx / d * ab.ground; pt.z = f.pos.z + dz / d * ab.ground; }
@@ -1503,6 +1604,30 @@ function fireAbility(f, i, ab, o) {
   f.anim = .22;
   ab.act(f, o);
   if (i === 0 && ab.combo) { f.combo = (f.combo + 1) % ab.combo; f.comboT = 1.4; }
+}
+
+/* Aplica un comando de entrada a un luchador. Es el gemelo exacto de
+   updateAI: ambos dejan al luchador con un moveDir, un aimDir y, como mucho,
+   una habilidad intentada. Nadie más escribe esas intenciones, y por eso un
+   bot puede sustituir a un humano sin que nada más cambie. */
+const _cmdDir = { x: 0, z: 0 };
+function applyInput(f, cmd) {
+  if (cmd.move === CMD_STILL) { f.moveDir.x = 0; f.moveDir.z = 0; }
+  else { byteToDir(cmd.move, _cmdDir); f.moveDir.x = _cmdDir.x; f.moveDir.z = _cmdDir.z; }
+  byteToDir(cmd.aim, _cmdDir);
+  f.aimDir.x = _cmdDir.x; f.aimDir.z = _cmdDir.z;
+  const d = cmd.aimD / 10;
+  f.aimPt.x = f.pos.x + _cmdDir.x * d;
+  f.aimPt.z = f.pos.z + _cmdDir.z * d;
+  if (G.state !== 'live') { f.moveDir.x = f.moveDir.z = 0; return; }
+  const b = cmd.buttons, ex = !!cmd.ex;
+  if (b & BTN.M1) tryCast(f, 0, false);
+  if (b & BTN.M2) tryCast(f, 1, ex);
+  if (b & BTN.SP) tryCast(f, 2, false);
+  if (b & BTN.Q) tryCast(f, 3, ex);
+  if (b & BTN.E) tryCast(f, 4, ex);
+  if (b & BTN.F) tryCast(f, 5, ex);
+  if (b & BTN.R) tryCast(f, 6, false);
 }
 
 /* ============================ tick de luchador ============================ */
@@ -1537,7 +1662,7 @@ function tickFighter(f, dt) {
     f.falling += dt;
     f.mesh.position.y -= dt * 14;
     f.mesh.rotation.z += dt * 3;
-    if (f.falling > .55) { killFighter(f, f.lastHitBy); f.mesh.visible = false; }
+    if (f.falling > .55) { killFighter(f, fighterById(f.lastHitById)); f.mesh.visible = false; }
     return;
   }
 
@@ -1565,15 +1690,15 @@ function tickFighter(f, dt) {
     f.pos.x += d.dx * step; f.pos.z += d.dz * step;
     if (collidePillars(f.pos, .5)) d.t = d.dur;
     pushInside(f.pos, .5);
-    if (d.trail && Math.random() < .5) puff(f.pos, d.trail, 2, .5);
+    if (d.trail && frand() < .5) puff(f.pos, d.trail, 2, .5);   // estela: presentación
     if (d.dmg || d.cc) {
       for (const t of G.fighters) {
-        if (t.team === f.team || !t.alive || d.hit.indexOf(t) >= 0) continue;
+        if (t.team === f.team || !t.alive || d.hit.indexOf(t.uid) >= 0) continue;
         if (dist(t.pos.x, t.pos.z, f.pos.x, f.pos.z) > 1.15) continue;
-        d.hit.push(t);
+        d.hit.push(t.uid);
         if (d.dmg) dealDamage(f, t, d.dmg);
         if (d.cc) applyCC(t, d.cc, d.ccT);
-        t.lastHitBy = f;
+        t.lastHitById = f.uid;
         if (d.stopOnHit) d.t = d.dur;
       }
     }
@@ -1613,12 +1738,17 @@ function tickFighter(f, dt) {
   }
 }
 
-function updateFighterVisual(f, dt) {
+/* La simulación avanza a saltos fijos de 1/60 s; `alpha` dice qué fracción del
+   siguiente paso lleva acumulada el fotograma actual. Interpolar entre la
+   posición anterior y la nueva es lo que mantiene el movimiento suave también
+   a 120 o 144 Hz, donde un paso fijo sin interpolar se vería a tirones. */
+function updateFighterVisual(f, alpha) {
   if (!f.alive || f.falling) return;
   const m = f.mesh;
-  m.position.x = f.pos.x; m.position.z = f.pos.z;
+  m.position.x = lerp(f.px, f.pos.x, alpha);
+  m.position.z = lerp(f.pz, f.pos.z, alpha);
   m.position.y = Math.abs(Math.sin(f.bob)) * .06 + (f.anim > 0 ? .1 : 0);
-  m.rotation.y = f.face;
+  m.rotation.y = f.pface + angDiff(f.face, f.pface) * alpha;
   const b = m.userData.body;
   const base = m.userData.base;
   const pulse = f.anim > 0 ? 1 + f.anim * .5 : 1;
@@ -1646,25 +1776,25 @@ function updateProjectiles(dt) {
     // pilares
     if (segHitsPillar(p.x, p.z, nx, nz, p.radius * .5)) { destroyProj(p, i, true); continue; }
     p.x = nx; p.z = nz;
-    p.mesh.position.set(p.x, 1.0, p.z);
     if (p.traveled > p.range || !insideArena(p.x, p.z, -1.5, 1)) { destroyProj(p, i, false); continue; }
+    const owner = fighterById(p.ownerId);
     let consumed = false;
     for (const t of G.fighters) {
-      if (!t.alive || t.falling || p.hit.indexOf(t) >= 0) continue;
+      if (!t.alive || t.falling || p.hit.indexOf(t.uid) >= 0) continue;
       const friendly = t.team === p.team;
       if (friendly && !p.healAlly) continue;
       if (dist(t.pos.x, t.pos.z, p.x, p.z) > p.radius + .55) continue;
-      p.hit.push(t);
+      p.hit.push(t.uid);
       if (friendly) {
-        healTarget(p.owner, t, p.healAlly);
+        healTarget(owner, t, p.healAlly);
       } else {
         if (t.st.evade > 0) { t.st.evade = 0; floatNum(t.pos, 'Evadido', 'en'); continue; }
-        dealDamage(p.owner, t, p.dmg);
-        t.lastHitBy = p.owner;
+        dealDamage(owner, t, p.dmg);
+        t.lastHitById = p.ownerId;
         if (p.cc) applyCC(t, p.cc, p.ccT);
         if (p.cc2) applyCC(t, p.cc2, p.cc2T);
-        if (p.pull) {
-          const dx = p.owner.pos.x - t.pos.x, dz = p.owner.pos.z - t.pos.z;
+        if (p.pull && owner) {
+          const dx = owner.pos.x - t.pos.x, dz = owner.pos.z - t.pos.z;
           applyKnockback(t, dx, dz, Math.max(0, Math.hypot(dx, dz) - 2) * 4.2);
         } else if (p.kb) applyKnockback(t, p.dx, p.dz, p.kb);
       }
@@ -1673,6 +1803,9 @@ function updateProjectiles(dt) {
     }
     if (consumed) destroyProj(p, i, true);
   }
+}
+function updateProjectileVisual(alpha) {
+  for (const p of G.projectiles) p.mesh.position.set(lerp(p.px, p.x, alpha), 1.0, lerp(p.pz, p.z, alpha));
 }
 function destroyProj(p, i, fx) {
   if (fx) hitFx(p.x, p.z, p.col);
@@ -1693,15 +1826,16 @@ function updateZones(dt) {
     z.t += dt;
     z.ring.rotation.y += dt * .6;
     z.mesh.material.opacity = .13 + Math.sin(G.t * 3) * .03;
-    if (z.rain && Math.random() < dt * 40) {
-      const a = Math.random() * TAU, r = Math.sqrt(Math.random()) * z.radius;
+    if (z.rain && frand() < dt * 40) {                // solo lluvia visible
+      const a = frand() * TAU, r = Math.sqrt(frand()) * z.radius;
       rainFx(z.x + Math.cos(a) * r, z.z + Math.sin(a) * r, z.col);
     }
+    const owner = fighterById(z.ownerId);
     if (z.trap) {
       for (const t of G.fighters) {
         if (t.team === z.team || !t.alive) continue;
         if (dist(t.pos.x, t.pos.z, z.x, z.z) > z.radius) continue;
-        dealDamage(z.owner, t, z.dmg);
+        dealDamage(owner, t, z.dmg);
         applyCC(t, z.cc, z.ccT);
         ringFx({ x: z.x, y: 0, z: z.z }, z.radius, z.col);
         z.t = z.dur + 1;
@@ -1715,8 +1849,8 @@ function updateZones(dt) {
           for (const t of G.fighters) {
             if (!t.alive) continue;
             if (dist(t.pos.x, t.pos.z, z.x, z.z) > z.radius) continue;
-            if (t.team === z.team) { if (z.tickHeal) healTarget(z.owner, t, z.tickHeal); }
-            else if (z.tickDmg) { dealDamage(z.owner, t, z.tickDmg); t.lastHitBy = z.owner; }
+            if (t.team === z.team) { if (z.tickHeal) healTarget(owner, t, z.tickHeal); }
+            else if (z.tickDmg) { dealDamage(owner, t, z.tickDmg); t.lastHitById = z.ownerId; }
           }
         }
       }
@@ -1780,10 +1914,10 @@ function clearPickups() {
 /* ============================ efectos ============================ */
 function puff(pos, col, n, scale) {
   for (let i = 0; i < n; i++) {
-    const m = new THREE.Mesh(new THREE.SphereGeometry((scale || 1) * rnd(.08, .2), 6, 5), new THREE.MeshBasicMaterial({ color: col, transparent: true, opacity: .9 }));
-    m.position.set(pos.x + rnd(-.4, .4), (pos.y || 0) + rnd(.3, 1.5), pos.z + rnd(-.4, .4));
+    const m = new THREE.Mesh(new THREE.SphereGeometry((scale || 1) * frnd(.08, .2), 6, 5), new THREE.MeshBasicMaterial({ color: col, transparent: true, opacity: .9 }));
+    m.position.set(pos.x + frnd(-.4, .4), (pos.y || 0) + frnd(.3, 1.5), pos.z + frnd(-.4, .4));
     scene.add(m);
-    G.fx.push({ mesh: m, t: 0, dur: rnd(.3, .7), vy: rnd(1, 4), vx: rnd(-2.5, 2.5), vz: rnd(-2.5, 2.5), kind: 'puff' });
+    G.fx.push({ mesh: m, t: 0, dur: frnd(.3, .7), vy: frnd(1, 4), vx: frnd(-2.5, 2.5), vz: frnd(-2.5, 2.5), kind: 'puff' });
   }
 }
 function hitFx(x, z, col) {
@@ -1862,7 +1996,7 @@ const ROLE_RANGE = { 'Tirador': 8.6, 'Vanguardia': 2.5, 'Custodio': 7.4 };
 function makeAI(f, diffId) {
   f.ai = {
     d: DIFFS[diffId] || DIFFS.normal,
-    tgt: null, retgt: 0, think: 0, err: 0, strafe: Math.random() < .5 ? 1 : -1, strafeT: 0,
+    tgtId: 0, retgt: 0, think: 0, err: 0, strafe: chance(.5) ? 1 : -1, strafeT: 0,
     hold: 0, m1T: 0, panic: 0, want: { x: 0, z: 0 }
   };
 }
@@ -1877,13 +2011,15 @@ function alliesOf(f) { return G.fighters.filter(o => o.alive && o.team === f.tea
 function updateAI(f, dt) {
   const ai = f.ai, D = ai.d;
   ai.think -= dt; ai.strafeT -= dt; ai.retgt -= dt; ai.hold -= dt;
-  if (ai.strafeT <= 0) { ai.strafeT = rnd(.7, 1.9); if (Math.random() < .5) ai.strafe *= -1; }
+  if (ai.strafeT <= 0) { ai.strafeT = rnd(.7, 1.9); if (chance(.5)) ai.strafe *= -1; }
 
   const foes = enemiesOf(f);
   if (!foes.length) { f.moveDir.x = f.moveDir.z = 0; return; }
 
-  // objetivo
-  if (!ai.tgt || !ai.tgt.alive || ai.retgt <= 0) {
+  // objetivo: se guarda por id, no por referencia, para que el estado de la
+  // IA se pueda serializar y rebobinar igual que el resto de la simulación
+  let tgt = fighterById(ai.tgtId);
+  if (!tgt || !tgt.alive || ai.retgt <= 0) {
     ai.retgt = rnd(1.2, 2.4);
     let best = null, bs = -1e9;
     for (const e of foes) {
@@ -1892,9 +2028,10 @@ function updateAI(f, dt) {
       if (e === G.player) s += 1.5;
       if (s > bs) { bs = s; best = e; }
     }
-    ai.tgt = best;
+    tgt = best;
+    ai.tgtId = best ? best.uid : 0;
   }
-  const tgt = ai.tgt;
+  if (!tgt) { f.moveDir.x = f.moveDir.z = 0; return; }
   const d = dist(f.pos.x, f.pos.z, tgt.pos.x, tgt.pos.z);
   const want = ROLE_RANGE[f.champ.role] || 6;
 
@@ -1910,7 +2047,7 @@ function updateAI(f, dt) {
   const cur = Math.atan2(f.aimDir.x, f.aimDir.z);
   a = cur + angDiff(a, cur) * Math.min(1, dt * (6 + 16 * (1 - D.react)));
   f.aimDir.x = Math.sin(a); f.aimDir.z = Math.cos(a);
-  f.aimPt.set(lead.x, 0, lead.z);
+  f.aimPt.x = lead.x; f.aimPt.z = lead.z;
 
   // ---- vector de movimiento ----
   let mx = 0, mz = 0;
@@ -1937,7 +2074,7 @@ function updateAI(f, dt) {
     if (toX * p.dx + toZ * p.dz < 0) continue;              // ya pasó
     const cross = Math.abs(toX * p.dz - toZ * p.dx);
     if (cross > p.radius + 1.5) continue;
-    if (Math.random() > D.dodge) continue;
+    if (!chance(D.dodge)) continue;
     const side = (toX * p.dz - toZ * p.dx) >= 0 ? 1 : -1;
     dodging = { x: p.dz * side, z: -p.dx * side, urgency: 1 - rel / 11 };
     mx += dodging.x * 2.2; mz += dodging.z * 2.2;
@@ -1994,7 +2131,7 @@ function updateAI(f, dt) {
 }
 
 function wantEx(f, ctx, cost) {
-  return f.energy >= (cost || 50) + 8 && Math.random() < ctx.D.exUse;
+  return f.energy >= (cost || 50) + 8 && chance(ctx.D.exUse);
 }
 
 const BOT_PLANS = {
@@ -2004,25 +2141,25 @@ const BOT_PLANS = {
   vesk(f, c) {
     const { tgt, d, D } = c;
     // definitiva si el rival está controlado o cerca del centro
-    if (canCast(f, 6) && d < 14 && (tgt.st.stun > 0 || tgt.st.root > 0 || Math.random() < .5)) return { i: 6 };
+    if (canCast(f, 6) && d < 14 && (tgt.st.stun > 0 || tgt.st.root > 0 || chance(.5))) return { i: 6 };
     // patada: empujar al vacío si el borde está detrás del rival
     if (canCast(f, 5) && d < 3.3) {
       const bx = tgt.pos.x + (tgt.pos.x - f.pos.x), bz = tgt.pos.z + (tgt.pos.z - f.pos.z);
       const toEdge = edgeDepth(bx, bz, 1) < 1.4;
-      if (toEdge || tgt.hp / tgt.maxHp < .45 || Math.random() < .5) return { i: 5, ex: toEdge && wantEx(f, c, 50) };
+      if (toEdge || tgt.hp / tgt.maxHp < .45 || chance(.5)) return { i: 5, ex: toEdge && wantEx(f, c, 50) };
     }
     // humo para huir o correr
-    if (canCast(f, 4) && (c.lowHp < .45 || (d < 4 && Math.random() < .4))) return { i: 4, ex: c.lowHp < .3 && wantEx(f, c) };
+    if (canCast(f, 4) && (c.lowHp < .45 || (d < 4 && chance(.4)))) return { i: 4, ex: c.lowHp < .3 && wantEx(f, c) };
     // trampa delante del rival
-    if (canCast(f, 3) && d < 12 && Math.random() < .7) {
+    if (canCast(f, 3) && d < 12 && chance(.7)) {
       const p = predictPos(tgt, .55);
-      f.aimPt.set(p.x, 0, p.z);
+      f.aimPt.x = p.x; f.aimPt.z = p.z;
       return { i: 3, ex: wantEx(f, c) };
     }
     // saeta perforante si hay línea
     if (canCast(f, 1) && !c.blocked && d < 22) return { i: 1, ex: wantEx(f, c) };
     // rodar para separarse o esquivar
-    if (canCast(f, 2) && ((c.dodging && Math.random() < D.dodge) || (d < 3 && Math.random() < .5))) {
+    if (canCast(f, 2) && ((c.dodging && chance(D.dodge)) || (d < 3 && chance(.5)))) {
       const away = c.dodging || { x: (f.pos.x - tgt.pos.x), z: (f.pos.z - tgt.pos.z) };
       f.moveDir.x = away.x; f.moveDir.z = away.z;
       return { i: 2 };
@@ -2064,16 +2201,16 @@ const BOT_PLANS = {
       }
     }
     if (canCast(f, 4) && hurt && worst < .7) {                      // égida
-      f.aimPt.set(hurt.pos.x, 0, hurt.pos.z);
+      f.aimPt.x = hurt.pos.x; f.aimPt.z = hurt.pos.z;
       return { i: 4, ex: worst < .45 && wantEx(f, c) };
     }
     if (canCast(f, 3) && (worst < .8 || d < 9)) {                   // santuario
       const base = hurt && hurt !== f ? hurt.pos : f.pos;
-      f.aimPt.set(base.x, 0, base.z);
+      f.aimPt.x = base.x; f.aimPt.z = base.z;
       return { i: 3, ex: wantEx(f, c) };
     }
-    if (canCast(f, 5) && d < 14 && !c.blocked && Math.random() < .8) return { i: 5, ex: wantEx(f, c) };
-    if (canCast(f, 2) && d < 3.5 && Math.random() < .6) {
+    if (canCast(f, 5) && d < 14 && !c.blocked && chance(.8)) return { i: 5, ex: wantEx(f, c) };
+    if (canCast(f, 2) && d < 3.5 && chance(.6)) {
       f.moveDir.x = (f.pos.x - tgt.pos.x); f.moveDir.z = (f.pos.z - tgt.pos.z);
       return { i: 2 };
     }
@@ -2196,7 +2333,7 @@ function floatNum(pos, text, cls) {
   d.textContent = text;
   d.style.opacity = '1';
   plateHost.appendChild(d);
-  const p = { el: d, x: pos.x + rnd(-.4, .4), y: 1.9, z: pos.z + rnd(-.3, .3), t: 0, vy: 2.1 };
+  const p = { el: d, x: pos.x + frnd(-.4, .4), y: 1.9, z: pos.z + frnd(-.3, .3), t: 0, vy: 2.1 };
   FLOATS.push(p);
 }
 const FLOATS = [];
@@ -2227,7 +2364,7 @@ function updatePlates() {
     if (!d) continue;
     if (!f.alive) { d.style.display = 'none'; continue; }
     d.style.display = '';
-    tmpV.set(f.pos.x, 2.35, f.pos.z).project(camera);
+    tmpV.set(f.mesh.position.x, 2.35, f.mesh.position.z).project(camera);
     d.style.transform = `translate(${(tmpV.x * .5 + .5) * window.innerWidth}px,${(-tmpV.y * .5 + .5) * window.innerHeight}px) translate(-50%,-100%)`;
     d.q.hp.style.transform = `scaleX(${clamp(f.hp / f.maxHp, 0, 1)})`;
     d.q.sh.style.transform = `scaleX(${clamp(f.shield / f.maxHp, 0, 1)})`;
@@ -2299,7 +2436,7 @@ function buildTeamFrames() {
   }
 }
 
-function updateHUD(dt) {
+function updateHUD() {
   const f = G.player;
   if (!f) return;
   const hpr = clamp(f.hp / f.maxHp, 0, 1);
@@ -2380,9 +2517,14 @@ function spawnPoints(team, n) {
   return out;
 }
 
-function startMatch() {
+/* `seed` sirve para repetir una partida entera: con la misma semilla y la
+   misma entrada, el combate se desarrolla igual paso a paso. Si no se pasa, se
+   sortea una y se guarda en G.seed. */
+function startMatch(seed) {
   SFX.init();
   quitMatch();
+  G.seed = seed === undefined ? (frand() * 0xFFFFFFFF) >>> 0 : (seed >>> 0);
+  seedSim(G.seed);
   G.mode = MODES[SEL.mode];
   G.diff = SEL.diff;
   G.wins = G.mode.wins;
@@ -2428,6 +2570,8 @@ function startMatch() {
 function quitMatch() {
   for (const f of G.fighters) { scene.remove(f.mesh); if (f.plate) f.plate.remove(); }
   G.fighters.length = 0;
+  G.byId.clear();
+  _uid = 0;                 // los ids arrancan de cero en cada partida, como en un servidor
   G.player = null; G.started = false; G.sudden = false; G.shrink = 1;
   sdRing.visible = false;
   clearTransient();
@@ -2483,8 +2627,8 @@ function openRelicPick() {
   while (opts.length < 3) {
     let cand;
     if (opts.length === 0) cand = pickOne(byRar('com'));
-    else if (opts.length === 1) cand = pickOne(byRar(Math.random() < .6 ? 'rare' : 'com'));
-    else cand = pickOne(byRar(wantEpic && Math.random() < .55 ? 'epic' : 'rare'));
+    else if (opts.length === 1) cand = pickOne(byRar(chance(.6) ? 'rare' : 'com'));
+    else cand = pickOne(byRar(wantEpic && chance(.55) ? 'epic' : 'rare'));
     if (!cand) cand = pickOne(pool.filter(x => !opts.includes(x)));
     if (!cand) break;
     opts.push(cand);
@@ -2540,25 +2684,15 @@ function togglePause() {
   else { G.paused = true; showScreen('scr-pause'); }
 }
 /* ============================ entrada del jugador ============================ */
+/* Muestrear y aplicar son dos pasos separados a propósito: entre medias hay un
+   comando, que es un dato plano. Hoy va directo del teclado a la simulación;
+   con el modo online irá además por la red y se volverá a aplicar al
+   reconciliar. */
+let _cmdSeq = 0;
 function playerControl() {
   const f = G.player;
   if (!f || !f.alive) return;
-  updateAim();
-  const mv = moveInput();
-  f.moveDir.x = mv.x; f.moveDir.z = mv.z;
-  f.aimDir.x = Input.aimDir.x; f.aimDir.z = Input.aimDir.z;
-  f.aimPt.set(Input.aim.x, 0, Input.aim.z);
-  if (G.state !== 'live') { f.moveDir.x = f.moveDir.z = 0; return; }
-
-  const ex = Input.shift || Input.exMode;
-  if (Input.queued) { tryCast(f, Input.queued.i, Input.queued.ex || Input.shift); Input.queued = null; if (Input.exMode) { Input.exMode = false; syncEx(); } }
-  if (Input.m1 || (Input.touch && Input.tFire)) tryCast(f, 0, false);
-  if (Input.m2) tryCast(f, 1, ex);
-  if (Input.keys[' ']) tryCast(f, 2, false);
-  if (Input.keys['q']) tryCast(f, 3, ex);
-  if (Input.keys['e']) tryCast(f, 4, ex);
-  if (Input.keys['f']) tryCast(f, 5, ex);
-  if (Input.keys['r']) tryCast(f, 6, false);
+  applyInput(f, sampleInput(_cmdSeq++));
 }
 
 /* ============================ ritmo de la ronda ============================ */
@@ -2645,42 +2779,59 @@ function updateRound(dt) {
   }
 }
 
+/* ============================ simulación ============================ */
+/* Un paso de simulación. Todo lo que cambia el estado de juego ocurre aquí y
+   solo aquí, siempre con el mismo dt. Lo que queda fuera es vista: se podría
+   quitar entero y la partida acabaría igual. */
+function simStep(dt) {
+  G.dt = dt;
+  // la posición del paso anterior sirve para dos cosas: estimar la velocidad
+  // (la usan los bots al predecir) e interpolar la vista entre pasos
+  for (const f of G.fighters) { f.px = f.pos.x; f.pz = f.pos.z; f.pface = f.face; }
+  for (const p of G.projectiles) { p.px = p.x; p.pz = p.z; }
+
+  playerControl();
+  G.order++;
+  const order = fightersInOrder();
+  if (G.state === 'live') {
+    for (const f of order) if (f.isBot && f.alive) updateAI(f, dt);
+  } else {
+    for (const f of G.fighters) { f.moveDir.x = 0; f.moveDir.z = 0; }
+  }
+  for (const f of order) tickFighter(f, dt);
+  updateProjectiles(dt);
+  updateZones(dt);
+  updatePickups(dt);
+  for (const f of G.fighters) {
+    f.velEst.x = (f.pos.x - f.px) / dt;
+    f.velEst.z = (f.pos.z - f.pz) / dt;
+  }
+  updateRound(dt);
+}
+
 /* ============================ bucle ============================ */
-let _last = 0;
+let _acc = 0;
 function frame() {
   requestAnimationFrame(frame);
-  const raw = Math.min(.05, clock.getDelta());
+  const raw = Math.min(.25, clock.getDelta());
   G.t += raw;
 
   const simState = G.state === 'intro' || G.state === 'live' || G.state === 'roundend';
-  if (G.started && !G.paused && simState) {
-    const dt = raw * (G.state === 'roundend' ? G.timeScale : 1);
-    G.dt = dt;
-    playerControl();
-    for (const f of G.fighters) {
-      f.velEst = f.velEst || { x: 0, z: 0 };
-      f._px = f._px === undefined ? f.pos.x : f._px;
-      f._pz = f._pz === undefined ? f.pos.z : f._pz;
-    }
-    G.order++;
-    const order = fightersInOrder();
-    if (G.state === 'live') {
-      for (const f of order) if (f.isBot && f.alive) updateAI(f, dt);
-    } else {
-      for (const f of G.fighters) { f.moveDir.x = 0; f.moveDir.z = 0; }
-    }
-    for (const f of order) tickFighter(f, dt);
-    updateProjectiles(dt);
-    updateZones(dt);
-    updatePickups(dt);
-    for (const f of G.fighters) {
-      f.velEst.x = (f.pos.x - f._px) / Math.max(dt, .001);
-      f.velEst.z = (f.pos.z - f._pz) / Math.max(dt, .001);
-      f._px = f.pos.x; f._pz = f.pos.z;
-      updateFighterVisual(f, dt);
-    }
-    updateRound(dt);
-    updateHUD(dt);
+  const simming = G.started && !G.paused && simState;
+  if (simming) {
+    // el acumulador recibe tiempo de juego, no real: la cámara lenta del
+    // remate de ronda da menos pasos, nunca pasos más cortos
+    _acc += raw * (G.state === 'roundend' ? G.timeScale : 1);
+    let n = 0;
+    while (_acc >= STEP && n < MAX_STEPS) { simStep(STEP); _acc -= STEP; n++; }
+    if (_acc >= STEP) _acc = 0;      // tras un parón el tiempo se pierde, no se recupera
+  } else _acc = 0;
+
+  const alpha = simming ? _acc / STEP : 1;
+  for (const f of G.fighters) updateFighterVisual(f, alpha);
+  updateProjectileVisual(alpha);
+  if (simming) {
+    updateHUD();
     updatePlates();
     if (G.announceT > 0) { G.announceT -= raw; if (G.announceT <= 0) clearAnnounce(); }
   }

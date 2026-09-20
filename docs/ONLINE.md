@@ -5,7 +5,9 @@ jugador contra bots, todo en una pestaña. Este documento decide **qué modelo d
 red usar**, audita **qué del código actual lo impide** y propone **un plan por
 etapas** en el que cada paso se puede entregar y probar por separado.
 
-Nada de esto está implementado todavía. Es el plan, no el estado.
+**Estado: etapa 1 hecha.** La simulación ya es determinista y la entrada ya
+es un dato. Falta todo lo demás — no hay servidor, ni socket, ni una sola línea
+de red. Cada apartado dice en qué punto está.
 
 ---
 
@@ -113,9 +115,20 @@ Es la etapa 2 del plan y ahorra muchísimo tiempo.
 
 ## 3. Auditoría: qué impide hoy el online
 
-Siete obstáculos concretos. Cinco son refactores mecánicos; dos exigen pensar.
+Siete obstáculos concretos. Cinco están resueltos (etapa 1); quedan dos, los
+que más código tocan.
 
-### 3.1 Paso de tiempo variable — `60_loop.js`
+| | Obstáculo | Estado |
+|---|---|---|
+| 3.1 | paso de tiempo variable | **hecho** |
+| 3.2 | aleatoriedad sin semilla | **hecho** |
+| 3.3 | la simulación crea mallas | pendiente (etapa 2) |
+| 3.4 | `pos` es un `THREE.Vector3` | **hecho** |
+| 3.5 | referencias cruzadas entre entidades | **hecho** |
+| 3.6 | `G` es un singleton | pendiente (se pospone a propósito) |
+| 3.7 | la entrada se lee dentro de la simulación | **hecho** |
+
+### 3.1 Paso de tiempo variable — `60_loop.js` · **hecho**
 
 ```js
 const raw = Math.min(.05, clock.getDelta());
@@ -140,10 +153,21 @@ function frame() {
 }
 ```
 
-Cambio pequeño y de efecto grande: también elimina la dependencia sutil de la
-física respecto a los fps que hoy tiene el juego.
+Implementado así, con dos detalles que el esbozo no contemplaba:
 
-### 3.2 Aleatoriedad sin semilla — `40_ai.js`, `30_combat.js`
+- **La cámara lenta escala el acumulador, no el paso.** `_acc += raw *
+  timeScale` da *menos pasos* en el remate de ronda, nunca pasos más cortos. El
+  paso de simulación sigue siendo 1/60 exacto, que es lo que hace falta.
+- **Interpolación en la vista.** Con paso fijo a 60 Hz y pantalla a 144, dibujar
+  la última posición simulada se ve a tirones. Cada luchador y cada proyectil
+  guardan su posición del paso anterior (`px`, `pz`, `pface`) y
+  `updateFighterVisual(f, alpha)` interpola entre ambas. El ángulo se interpola
+  con `angDiff` para que no dé la vuelta larga al cruzar ±π.
+
+Tras un parón largo (pestaña en segundo plano) el tiempo pendiente se descarta
+en vez de recuperarse: `MAX_STEPS = 5` pasos por fotograma como techo.
+
+### 3.2 Aleatoriedad sin semilla — `40_ai.js`, `30_combat.js` · **hecho**
 
 `Math.random()` aparece quince veces en la IA y ocho en combate. La mayoría de
 las de combate son cosméticas (partículas, la lluvia de `updateZones`), pero
@@ -171,11 +195,17 @@ desincronización que aparecerá una vez cada cien partidas y costará un día
 encontrar. Vale la pena una comprobación en los tests que recorra `src/` y falle
 si aparece `Math.random` fuera de las funciones de efectos.
 
-Beneficio colateral inmediato, antes incluso de que haya red: con semilla fija,
-`tests/sim.js` se vuelve reproducible, y un cambio de equilibrio se puede medir
-contra exactamente la misma secuencia de partidas.
+Implementado con dos juegos de ayudantes en `10_core.js`: `rnd`, `irnd`,
+`pickOne` y `chance` tiran de `srand()`; `frnd`, `firnd` y `frand` son los
+cosméticos. `Math.random` solo aparece ya en las tres líneas que definen los
+cosméticos, y **`node tests/lint_rng.js` falla si reaparece en cualquier otro
+sitio** — que era justo la comprobación que este documento prometía.
 
-### 3.3 La simulación crea mallas — `30_combat.js`, `20_champs.js`
+Beneficio colateral, ya disponible: `tests/sim.js` acepta `SIM_SEED` y es
+reproducible, así que un cambio de equilibrio se mide contra exactamente la
+misma secuencia de partidas. `startMatch(seed)` guarda la semilla en `G.seed`.
+
+### 3.3 La simulación crea mallas — `30_combat.js`, `20_champs.js` · pendiente
 
 `makeFighter` monta un `THREE.Group`, `shoot` crea una `SphereGeometry`,
 `spawnZone` crea dos mallas y las añade a `scene`. El servidor no tiene escena.
@@ -201,22 +231,26 @@ hicieron los demás sin haberlo simulado.
 Lo mismo con el sonido: `SFX.shot()` dentro de `act()` pasa a ser un evento. Es
 el cambio que más archivos toca, pero es mecánico.
 
-### 3.4 `pos` es un `THREE.Vector3`
+### 3.4 `pos` es un `THREE.Vector3` · **hecho**
 
-Un tipo de la capa de render dentro del estado de juego. Sustituir por
-`{x: 0, z: 0}` plano. La `y` no se usa para nada en la simulación — solo la
-lee la vista para el balanceo y la caída.
+Era un tipo de la capa de render dentro del estado de juego. Ahora `pos` y
+`aimPt` se crean con `vec3(x, y, z)`, que devuelve un objeto plano. Se conserva
+la `y` porque la lee la vista (balanceo, caída al vacío), pero la simulación no
+la usa para nada.
 
-### 3.5 Referencias cruzadas entre entidades
+### 3.5 Referencias cruzadas entre entidades · **hecho**
 
-`proj.owner` y `zone.owner` apuntan al objeto luchador. Eso impide serializar
-`G` y, con rebobinado, provoca que un proyectil guarde una referencia a un
-luchador de un estado que ya se descartó.
+`proj.owner` y `zone.owner` apuntaban al objeto luchador, lo que impedía
+serializar `G` y, con rebobinado, dejaba proyectiles agarrados a un estado ya
+descartado.
 
-**Arreglo: guardar `ownerId` (el `uid`) y resolverlo al usarlo.** Hace falta un
-índice `G.byId = new Map()`.
+Ahora todo lo que señala a otra entidad guarda su `uid` y lo resuelve al
+usarlo, contra el índice `G.byId`: `proj.ownerId`, `zone.ownerId`,
+`f.lastHitById`, `ai.tgtId`, y las listas de ya-golpeados de proyectiles y
+desplazamientos. `quitMatch` reinicia el contador de ids a cero, como haría un
+servidor al abrir una sala.
 
-### 3.6 `G` es un singleton — `10_core.js`
+### 3.6 `G` es un singleton — `10_core.js` · pendiente, a propósito
 
 Un servidor necesita muchas partidas por proceso. Hoy hay un `G` global y
 funciones que lo leen directamente.
@@ -231,7 +265,7 @@ pronto. Recomendación: **empezar por el atajo**, medir, y hacer el refactor sol
 si el coste de memoria aparece de verdad. Un proceso por partida además aísla
 los fallos: una partida que revienta no se lleva las demás.
 
-### 3.7 La entrada se lee desde dentro de la simulación — `60_loop.js`
+### 3.7 La entrada se lee desde dentro de la simulación — `60_loop.js` · **hecho**
 
 ```js
 if (Input.m1 || (Input.touch && Input.tFire)) tryCast(f, 0, false);
@@ -245,13 +279,19 @@ ser un dato.
 **Arreglo: el comando de entrada como estructura.**
 
 ```js
-// 13 bytes en la red
+// 5 bytes más el número de secuencia
 { seq: 1234,            // contador, para que el servidor confirme
   move: 37,             // dirección de movimiento en 256 pasos, o 255 = quieto
   aim: 91,              // dirección de apuntado en 256 pasos
+  aimD: 125,            // distancia al punto apuntado, en decímetros
   buttons: 0b0010001,   // un bit por M1 M2 SP Q E F R
   ex: 1 }               // modificador de versión mejorada
 ```
+
+`aimD` no estaba en el esbozo y hace falta: tres habilidades se apuntan a un
+punto del suelo (`ground`) y la Égida de Lumen busca al aliado más cercano a ese
+punto, así que con la dirección sola no basta. Un decímetro de precisión sobra
+para un alcance máximo de 15 m.
 
 Y la simulación pasa a consumirlo:
 
@@ -274,6 +314,13 @@ Nota de diseño: el apuntado va **cuantizado a 256 direcciones**, unos 1,4° por
 paso. Suficiente para un proyectil de radio 0,3 a 26 m, y hace el comando
 compacto. Si en pruebas se nota, se sube a 16 bits.
 
+Lo implementado: `sampleInput(seq)` en `10_core.js` lee teclado, ratón o
+joysticks y devuelve el comando; `applyInput(f, cmd)` en `30_combat.js` lo
+consume. `playerControl()` es ya solo el empalme entre los dos.
+`tests/input_cmd.js` comprueba la ida y vuelta de la cuantización (peor error
+medido: 0,69° sobre 1,41° de paso), que cada bit lance su habilidad y solo la
+suya, y que el punto apuntado sobreviva al viaje.
+
 ---
 
 ## 4. Plan por etapas
@@ -281,23 +328,34 @@ compacto. Si en pruebas se nota, se sube a 16 bits.
 Cada etapa deja el juego funcionando y con los tests en verde. No hay ninguna
 rama larga donde el juego esté roto.
 
-### Etapa 0 — Red de seguridad *(medio día)*
+### Etapa 0 — Red de seguridad · **hecha**
 
-`git init`, commit del estado actual, y una comprobación de regresión: guardar la
-salida de `node tests/sim.js` con semilla fija como referencia. Sin esto, todas
-las etapas siguientes son a ciegas.
+Repositorio iniciado y subido a GitHub, con el juego y esta documentación en el
+primer commit.
 
-### Etapa 1 — Simulación determinista *(2-3 días, sin red)*
+### Etapa 1 — Simulación determinista · **hecha**
 
-Paso fijo (§3.1), PRNG con semilla (§3.2), entrada como comando (§3.7),
-`pos` plano (§3.4), `ownerId` en vez de `owner` (§3.5).
+Paso fijo (§3.1), PRNG con semilla (§3.2), entrada como comando (§3.7), `pos`
+plano (§3.4), `ownerId` en vez de `owner` (§3.5).
 
-**Criterio de aceptación**: dos ejecuciones de `sim.js` con la misma semilla dan
-marcadores idénticos y el mismo recuento de habilidades. El juego se juega igual
-que antes.
+**Criterio de aceptación: cumplido.** `node tests/determinism.js` ejecuta la
+simulación tres veces en contextos limpios — dos con la misma semilla y una con
+otra — y compara una huella del estado final. Las dos primeras coinciden; la
+tercera no, que es lo que demuestra que la huella mide algo.
 
-Esta etapa **vale la pena aunque el online se cancele**: hace el equilibrio
-medible y los fallos reproducibles.
+Se comprobó además que **el juego no cambió**: cinco partidas de 12 rondas antes
+del refactor y cinco después dan la misma distribución de marcadores (el equipo 0
+gana el 20 % y el 18 % de las rondas respectivamente, con el mismo rango de 1 a 4
+victorias por partida). La asimetría es del banco de pruebas, que reparte
+reliquias desiguales a propósito para ejercitar los modificadores.
+
+Dos cosas que la etapa trajo de propina:
+
+- `tests/lint_rng.js` impide que vuelva a colarse un `Math.random()` en el camino
+  de simulación. Es la comprobación automática que §3.2 prometía.
+- Con semilla, `tests/sim.js` es reproducible: `SIM_SEED` y `SIM_ROUNDS` hacen
+  que un ajuste de equilibrio se pueda medir contra la misma secuencia exacta de
+  partidas, antes y después.
 
 ### Etapa 2 — Separar simulación de vista *(3-5 días, sin red)*
 

@@ -49,13 +49,23 @@ de combate se puede simular a 60 pasos por segundo desde la terminal. Sirve
 para detectar fallos y para medir el equilibrio.
 
 ```bash
-node tests/sim.js      # dos equipos de bots peleando; informa de habilidades usadas
-node tests/e2e.js      # menú -> partida -> rondas -> reliquias -> resultado
+node tests/sim.js           # dos equipos de bots peleando; informa de habilidades usadas
+node tests/e2e.js           # menú -> partida -> rondas -> reliquias -> resultado
+node tests/determinism.js   # misma semilla, misma partida
+node tests/input_cmd.js     # el comando de entrada, de punta a punta
+node tests/lint_rng.js      # ningún Math.random en el camino de simulación
 ```
 
 `tests/sim.js` es la herramienta útil para retocar números: cambia `comp` para
-enfrentar dos campeones concretos y repite; con 40-60 rondas el marcador da una
-señal razonable de si un ajuste ha funcionado.
+enfrentar dos campeones concretos y repite. La simulación lleva semilla, así que
+dos ejecuciones con la misma enfrentan exactamente las mismas partidas y la
+diferencia de marcador es el efecto de tu cambio, no del azar:
+
+```bash
+SIM_SEED=7 SIM_ROUNDS=60 node tests/sim.js
+```
+
+Con 40-60 rondas el marcador da una señal razonable; con doce, ruido.
 
 ## Añadir un campeón
 
@@ -111,10 +121,18 @@ interpolación**, salas de 1v1 a 3v3, y transporte WebSocket binario detrás de 
 interfaz para poder pasar a WebTransport más adelante.
 
 El activo que lo hace viable es que la simulación **ya corre sin navegador**
-(`tests/`): el servidor autoritativo es ese mismo código. Lo que falta antes de
-poder enchufar un socket son dos refactores que valen la pena por sí solos —
-paso de tiempo fijo con aleatoriedad con semilla, y separar simulación de
-presentación. El plan los divide en etapas entregables por separado.
+(`tests/`): el servidor autoritativo es ese mismo código.
+
+**La etapa 1 ya está hecha**: la simulación avanza en pasos fijos de 1/60, el
+azar lleva semilla, la entrada del jugador es un dato plano que se puede guardar
+y reaplicar, y ninguna entidad guarda referencias a otra. Con la misma semilla,
+una partida se desarrolla exactamente igual paso a paso — lo comprueba
+`tests/determinism.js`. De propina, ahora el equilibrio se puede medir de verdad
+y una repetición cabe en unos pocos kilobytes.
+
+Queda la etapa 2 antes de poder enchufar un socket: separar simulación de
+presentación, para que el código de juego no cree mallas de three.js ni llame al
+audio. El plan lo divide en etapas entregables por separado.
 
 ## Lo que no está
 

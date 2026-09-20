@@ -12,7 +12,7 @@ code = code.replace(/globalThis\.document = \{\n {2}createElement: [\s\S]*?\n\};
            .replace('globalThis.announce = () => { };\n', '');
 code += `
 SEL.mode = 'squad'; SEL.diff = 'hard'; SEL.champ = 'vesk';
-startMatch();
+startMatch(4242);   // con semilla: el recorrido es el mismo en cada ejecución
 const choose = () => {
   const c = document.getElementById('brite-cards');
   if (G.state === 'brite' && c.children.length) { const b = c.children[0]; ((b._ev && b._ev.click) || b.onclick).call(b); }
@@ -22,7 +22,7 @@ makeAI(G.player, 'hard');
 playerControl = () => { if (G.player.alive && G.state === 'live') updateAI(G.player, G.dt || 1/60); };
 let n = 0;
 while (G.state !== 'result' && n < 60*60*14) { frame(); n++; choose(); }
-console.log('estado final:', G.state, '· marcador', G.score.join('-'), '· rondas', G.round, '·', Math.round(n/60) + ' s simulados');
+console.log('semilla:', G.seed, '· estado final:', G.state, '· marcador', G.score.join('-'), '· rondas', G.round, '·', Math.round(n/60) + ' s simulados');
 console.log('daño del jugador:', Math.round(G.player.stats.dmg), '· bajas:', G.player.stats.kills);
 console.log('recorrido completo sin errores');
 `;

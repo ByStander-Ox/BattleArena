@@ -103,7 +103,7 @@ function floatNum(pos, text, cls) {
   d.textContent = text;
   d.style.opacity = '1';
   plateHost.appendChild(d);
-  const p = { el: d, x: pos.x + rnd(-.4, .4), y: 1.9, z: pos.z + rnd(-.3, .3), t: 0, vy: 2.1 };
+  const p = { el: d, x: pos.x + frnd(-.4, .4), y: 1.9, z: pos.z + frnd(-.3, .3), t: 0, vy: 2.1 };
   FLOATS.push(p);
 }
 const FLOATS = [];
@@ -134,7 +134,7 @@ function updatePlates() {
     if (!d) continue;
     if (!f.alive) { d.style.display = 'none'; continue; }
     d.style.display = '';
-    tmpV.set(f.pos.x, 2.35, f.pos.z).project(camera);
+    tmpV.set(f.mesh.position.x, 2.35, f.mesh.position.z).project(camera);
     d.style.transform = `translate(${(tmpV.x * .5 + .5) * window.innerWidth}px,${(-tmpV.y * .5 + .5) * window.innerHeight}px) translate(-50%,-100%)`;
     d.q.hp.style.transform = `scaleX(${clamp(f.hp / f.maxHp, 0, 1)})`;
     d.q.sh.style.transform = `scaleX(${clamp(f.shield / f.maxHp, 0, 1)})`;
@@ -206,7 +206,7 @@ function buildTeamFrames() {
   }
 }
 
-function updateHUD(dt) {
+function updateHUD() {
   const f = G.player;
   if (!f) return;
   const hpr = clamp(f.hp / f.maxHp, 0, 1);
@@ -287,9 +287,14 @@ function spawnPoints(team, n) {
   return out;
 }
 
-function startMatch() {
+/* `seed` sirve para repetir una partida entera: con la misma semilla y la
+   misma entrada, el combate se desarrolla igual paso a paso. Si no se pasa, se
+   sortea una y se guarda en G.seed. */
+function startMatch(seed) {
   SFX.init();
   quitMatch();
+  G.seed = seed === undefined ? (frand() * 0xFFFFFFFF) >>> 0 : (seed >>> 0);
+  seedSim(G.seed);
   G.mode = MODES[SEL.mode];
   G.diff = SEL.diff;
   G.wins = G.mode.wins;
@@ -335,6 +340,8 @@ function startMatch() {
 function quitMatch() {
   for (const f of G.fighters) { scene.remove(f.mesh); if (f.plate) f.plate.remove(); }
   G.fighters.length = 0;
+  G.byId.clear();
+  _uid = 0;                 // los ids arrancan de cero en cada partida, como en un servidor
   G.player = null; G.started = false; G.sudden = false; G.shrink = 1;
   sdRing.visible = false;
   clearTransient();
@@ -390,8 +397,8 @@ function openRelicPick() {
   while (opts.length < 3) {
     let cand;
     if (opts.length === 0) cand = pickOne(byRar('com'));
-    else if (opts.length === 1) cand = pickOne(byRar(Math.random() < .6 ? 'rare' : 'com'));
-    else cand = pickOne(byRar(wantEpic && Math.random() < .55 ? 'epic' : 'rare'));
+    else if (opts.length === 1) cand = pickOne(byRar(chance(.6) ? 'rare' : 'com'));
+    else cand = pickOne(byRar(wantEpic && chance(.55) ? 'epic' : 'rare'));
     if (!cand) cand = pickOne(pool.filter(x => !opts.includes(x)));
     if (!cand) break;
     opts.push(cand);

@@ -15,10 +15,17 @@ identificadores, en inglés.
 ## Comandos
 
 ```bash
-./build.sh              # src/ → crisol-arena.html  (obligatorio tras editar src/)
-node tests/sim.js       # 12 rondas de bots 3v3, ~300 ms; valida equilibrio y salud
-node tests/e2e.js       # recorrido completo: menú → rondas → reliquias → resultado
+./build.sh                  # src/ → crisol-arena.html  (obligatorio tras editar src/)
+node tests/sim.js           # 12 rondas de bots 3v3, ~300 ms; equilibrio y salud
+node tests/e2e.js           # recorrido completo: menú → rondas → reliquias → resultado
+node tests/determinism.js   # misma semilla ⇒ misma partida
+node tests/input_cmd.js     # el comando de entrada, de punta a punta
+node tests/lint_rng.js      # ningún Math.random en el camino de simulación
 ```
+
+`sim.js` acepta `SIM_SEED` y `SIM_ROUNDS`: con la misma semilla dos ejecuciones
+enfrentan exactamente las mismas partidas, que es como se mide un cambio de
+equilibrio.
 
 No hay `package.json`, ni instalación, ni linter. Node 22 basta.
 
@@ -34,8 +41,13 @@ No hay `package.json`, ni instalación, ni linter. Node 22 basta.
    las teclas y los bots indexan por posición.
 5. **No toques la rotación de `fightersInOrder()`**: sin ella, quien se procesa
    primero gana siempre el cuerpo a cuerpo (se midió: 58-2).
-6. **No metas `Math.random()` en la simulación** más de lo que ya hay: el modo
-   online exige determinismo y cada uso nuevo es trabajo futuro.
+6. **Nada de `Math.random()` en la simulación.** Usa `rnd`/`irnd`/`pickOne`/
+   `chance` (con semilla) si afecta al juego, y `frand`/`frnd`/`firnd` si es
+   solo visual. Rompe el determinismo sin dar error; `tests/lint_rng.js` falla.
+7. **Lo que cambia el estado va en `simStep(STEP)`**, con paso fijo de 1/60.
+   Lo que dibuja va en `frame()` y usa `raw`. No los mezcles.
+8. **Las entidades se señalan por `uid`, nunca por referencia** (`ownerId`,
+   `lastHitById`, `ai.tgtId`), y se resuelven con `fighterById(id)`.
 
 ## Dónde está cada cosa
 
@@ -51,9 +63,13 @@ No hay `package.json`, ni instalación, ni linter. Node 22 basta.
 
 ## Antes de terminar una tarea
 
-Los dos tests pasan. Para cambios de equilibrio, mide con `tests/sim.js` (edita
-`comp` y `SIZE` en `tests/test_drive.js`, sube a 40-60 rondas); doce rondas son
-ruido.
+Los cinco tests pasan. Para cambios de equilibrio, mide con `tests/sim.js`
+(edita `comp` y `SIZE` en `tests/test_drive.js`, fija `SIM_SEED` y sube a 40-60
+rondas); doce rondas son ruido.
+
+`tests/test_drive.js` reproduce a mano el bucle de `simStep`, porque no carga la
+capa de partida ni la interfaz. Si cambias el orden de `simStep`, cámbialo
+también allí.
 
 ## Documentación
 
